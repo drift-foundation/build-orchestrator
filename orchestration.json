@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "workspace": {
+    "root": "..",
+    "run_root": "build/runs",
+    "state_root": "state"
+  },
+  "repos": {
+    "drift-lang": {
+      "path": "../drift-lang",
+      "kind": "toolchain",
+      "depends_on": [],
+      "affects": [
+        "drift-mariadb-client",
+        "drift-net-tls",
+        "drift-web"
+      ],
+      "commands": {
+        "bootstrap": ["bash", "-c", "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/pip install pex"],
+        "stage_toolchain": ["just", "deploy", "--dest", "{toolchain_root}"]
+      }
+    },
+    "drift-mariadb-client": {
+      "path": "../drift-mariadb-client",
+      "kind": "package_repo",
+      "depends_on": ["drift-lang"],
+      "affects": [],
+      "commands": {
+        "test": ["just", "test"],
+        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
+      }
+    },
+    "drift-net-tls": {
+      "path": "../drift-net-tls",
+      "kind": "package_repo",
+      "depends_on": ["drift-lang"],
+      "affects": ["drift-web"],
+      "commands": {
+        "test": ["just", "test"],
+        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
+      }
+    },
+    "drift-web": {
+      "path": "../drift-web",
+      "kind": "package_repo",
+      "depends_on": ["drift-lang", "drift-net-tls"],
+      "affects": [],
+      "commands": {
+        "test": ["just", "test"],
+        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
+      }
+    }
+  },
+  "environment": {
+    "toolchain_bin_rel": "bin",
+    "driftc_rel": "bin/driftc",
+    "drift_rel": "bin/drift",
+    "vars": {
+      "DRIFTC": "{toolchain_root}/current/bin/driftc",
+      "DRIFT_PACKAGE_ROOT": "{libs_root}",
+      "DRIFT_PKG_ROOT": "{libs_root}"
+    }
+  }
+}

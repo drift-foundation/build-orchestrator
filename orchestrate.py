@@ -1,0 +1,1167 @@
+#!/usr/bin/env python3
+"""Workspace certification orchestrator for the drift ecosystem."""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RepoConfig:
+    name: str
+    path: str
+    kind: str
+    depends_on: list[str]
+    affects: list[str]
+    commands: dict[str, list[str]]
+
+
+@dataclass
+class OrchestrationConfig:
+    schema_version: int
+    workspace_root: str
+    run_root: str
+    state_root: str
+    repos: dict[str, RepoConfig]
+    environment: dict
+
+    @staticmethod
+    def load(path: Path) -> "OrchestrationConfig":
+        raw = json.loads(path.read_text())
+        repos = {}
+        for name, r in raw["repos"].items():
+            repos[name] = RepoConfig(
+                name=name,
+                path=r["path"],
+                kind=r["kind"],
+                depends_on=r.get("depends_on", []),
+                affects=r.get("affects", []),
+                commands=r.get("commands", {}),
+            )
+        return OrchestrationConfig(
+            schema_version=raw["schema_version"],
+            workspace_root=raw["workspace"]["root"],
+            run_root=raw["workspace"]["run_root"],
+            state_root=raw["workspace"]["state_root"],
+            repos=repos,
+            environment=raw.get("environment", {}),
+        )
+
+
+@dataclass
+class WorkspaceLock:
+    """The last certified workspace snapshot."""
+    schema_version: int
+    repos: dict[str, str]   # repo name -> commit SHA
+
+    @staticmethod
+    def load(path: Path) -> Optional["WorkspaceLock"]:
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text())
+        repos = {}
+        for name, info in raw.get("repos", {}).items():
+            repos[name] = info["commit"]
+        return WorkspaceLock(
+            schema_version=raw.get("schema_version", 1),
+            repos=repos,
+        )
+
+
+@dataclass
+class ExecutionPlan:
+    candidate_commits: dict[str, str]
+    commit_sources: dict[str, str]     # repo -> "submitted" | "certified snapshot"
+    changed_repos: list[str]
+    involved_repos: list[str]
+    validated_repos: list[str]
+    steps: list[dict] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Graph operations
+# ---------------------------------------------------------------------------
+
+def build_forward_graph(config: OrchestrationConfig) -> dict[str, list[str]]:
+    """Build adjacency list: repo -> list of repos it affects."""
+    graph: dict[str, list[str]] = {name: [] for name in config.repos}
+    for name, repo in config.repos.items():
+        for target in repo.affects:
+            if target in config.repos:
+                graph[name].append(target)
+    return graph
+
+
+def compute_affected(
+    forward_graph: dict[str, list[str]], changed: list[str]
+) -> list[str]:
+    """BFS from changed repos through forward edges to find all affected repos."""
+    visited: set[str] = set()
+    queue = deque(changed)
+    while queue:
+        repo = queue.popleft()
+        if repo in visited:
+            continue
+        visited.add(repo)
+        for downstream in forward_graph.get(repo, []):
+            if downstream not in visited:
+                queue.append(downstream)
+    return list(visited)
+
+
+def topo_sort(
+    repos: list[str], config: OrchestrationConfig
+) -> list[str]:
+    """Topological sort of a subset of repos using depends_on edges."""
+    subset = set(repos)
+    in_degree: dict[str, int] = {r: 0 for r in repos}
+    adj: dict[str, list[str]] = {r: [] for r in repos}
+
+    for r in repos:
+        for dep in config.repos[r].depends_on:
+            if dep in subset:
+                adj[dep].append(r)
+                in_degree[r] += 1
+
+    queue = deque(r for r in repos if in_degree[r] == 0)
+    result: list[str] = []
+    while queue:
+        node = queue.popleft()
+        result.append(node)
+        for child in adj[node]:
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+
+    if len(result) != len(repos):
+        missing = subset - set(result)
+        print(f"error: dependency cycle detected involving: {missing}", file=sys.stderr)
+        sys.exit(1)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Commit input loading and validation
+# ---------------------------------------------------------------------------
+
+def load_commit_input(path: Path) -> dict[str, str]:
+    """Load candidate commits from a JSON file.
+
+    Expected format:
+    {
+      "drift-lang": "abc1234def5678...",
+      "drift-net-tls": "9999aaabbb..."
+    }
+    """
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        print("error: commit input must be a JSON object mapping repo names to SHAs",
+              file=sys.stderr)
+        sys.exit(1)
+    return raw
+
+
+def validate_shas(commits: dict[str, str]) -> None:
+    """Reject anything that is not a lowercase hex SHA (7-40 chars)."""
+    bad: list[str] = []
+    for name, sha in commits.items():
+        if not _SHA_RE.match(sha):
+            bad.append(f"  {name}: {sha!r}")
+    if bad:
+        print("error: commit values must be exact hex SHAs (7-40 lowercase hex chars):",
+              file=sys.stderr)
+        for line in bad:
+            print(line, file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Commit resolution
+# ---------------------------------------------------------------------------
+
+def resolve_commits(
+    config: OrchestrationConfig,
+    submitted: dict[str, str],
+    lock: Optional[WorkspaceLock],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Build the full commit map for a run.
+
+    Returns (commits, sources) where sources maps each repo to
+    "submitted" or "certified snapshot".
+    """
+    commits: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    missing: list[str] = []
+
+    for name in config.repos:
+        if name in submitted:
+            commits[name] = submitted[name]
+            sources[name] = "submitted"
+        elif lock and name in lock.repos:
+            commits[name] = lock.repos[name]
+            sources[name] = "certified snapshot"
+        else:
+            missing.append(name)
+
+    if missing:
+        print(
+            f"error: no commit specified and no certified snapshot for: "
+            f"{', '.join(missing)}\n"
+            f"hint: add these repos to your commit input file "
+            f"or create an initial state/workspace-lock.json",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return commits, sources
+
+
+def detect_changed(
+    commits: dict[str, str],
+    lock: Optional[WorkspaceLock],
+) -> list[str]:
+    """Derive which repos changed by diffing against the certified snapshot."""
+    if lock is None:
+        return list(commits.keys())
+    changed = []
+    for name, sha in commits.items():
+        certified = lock.repos.get(name)
+        if certified is None or certified != sha:
+            changed.append(name)
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Plan computation
+# ---------------------------------------------------------------------------
+
+def compute_plan(
+    config: OrchestrationConfig,
+    commits: dict[str, str],
+    sources: dict[str, str],
+    changed: list[str],
+) -> ExecutionPlan:
+    forward_graph = build_forward_graph(config)
+    affected = compute_affected(forward_graph, changed)
+
+    # Pull in dependency providers needed by affected repos (e.g. drift-lang
+    # as toolchain input even when it didn't change).
+    involved_set = set(affected)
+    for repo_name in list(affected):
+        for dep in config.repos[repo_name].depends_on:
+            involved_set.add(dep)
+
+    # Involved repos: all affected + their providers, topologically sorted.
+    involved = topo_sort(list(involved_set), config)
+
+    # Validated repos: affected repos that are package_repos (not toolchain).
+    validated = [r for r in involved
+                 if config.repos[r].kind != "toolchain" and r in affected]
+
+    # Build step list.
+    steps: list[dict] = []
+
+    for repo_name in involved:
+        repo = config.repos[repo_name]
+        if repo.kind == "toolchain":
+            if "bootstrap" in repo.commands:
+                steps.append({
+                    "repo": repo_name,
+                    "action": "bootstrap",
+                    "command": repo.commands["bootstrap"],
+                    "reason": "toolchain venv setup",
+                })
+            if "stage_toolchain" in repo.commands:
+                steps.append({
+                    "repo": repo_name,
+                    "action": "stage_toolchain",
+                    "command": repo.commands["stage_toolchain"],
+                    "reason": "toolchain staging" if repo_name in changed
+                        else "toolchain input from certified snapshot",
+                })
+        # Stage packages for any package_repo that is involved (whether
+        # validated or just a dependency provider for a validated repo).
+        if repo.kind == "package_repo" and "stage_packages" in repo.commands:
+            if repo_name in validated:
+                reason = ("directly changed" if repo_name in changed
+                          else f"depends on {_dep_reason(repo, changed)}")
+            else:
+                reason = "dependency provider for validated repos"
+            steps.append({
+                "repo": repo_name,
+                "action": "stage_packages",
+                "command": repo.commands["stage_packages"],
+                "reason": reason,
+            })
+        if repo_name in validated:
+            if "test" in repo.commands:
+                steps.append({
+                    "repo": repo_name,
+                    "action": "test",
+                    "command": repo.commands["test"],
+                    "reason": "directly changed" if repo_name in changed
+                        else f"depends on {_dep_reason(repo, changed)}",
+                })
+
+    return ExecutionPlan(
+        candidate_commits=commits,
+        commit_sources=sources,
+        changed_repos=changed,
+        involved_repos=involved,
+        validated_repos=validated,
+        steps=steps,
+    )
+
+
+def _dep_reason(repo: RepoConfig, changed: list[str]) -> str:
+    overlap = [d for d in repo.depends_on if d in changed]
+    if overlap:
+        return ", ".join(overlap)
+    return ", ".join(repo.depends_on)
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def print_plan(plan: ExecutionPlan, config: OrchestrationConfig) -> None:
+    print("Candidate commits:")
+    for r in plan.involved_repos:
+        sha = plan.candidate_commits.get(r, "???")
+        short = sha[:7] if len(sha) >= 7 else sha
+        source = plan.commit_sources.get(r, "???")
+        print(f"  {r:30s} {short}  ({source})")
+    print()
+
+    print("Changed:")
+    for r in plan.changed_repos:
+        print(f"  - {r}")
+    print()
+
+    print("Involved:")
+    for i, r in enumerate(plan.involved_repos, 1):
+        sha = plan.candidate_commits.get(r, "???")
+        short = sha[:7] if len(sha) >= 7 else sha
+        if r in plan.changed_repos:
+            tag = "(directly changed)"
+        elif config.repos[r].kind == "toolchain":
+            tag = "(toolchain input)"
+        else:
+            tag = "(dependency provider)"
+        print(f"  {i}. {r:30s} {short}  {tag}")
+    print()
+
+    print("Validated:")
+    for i, r in enumerate(plan.validated_repos, 1):
+        print(f"  {i}. {r}")
+    print()
+
+    print(f"Steps ({len(plan.steps)}):")
+    for i, step in enumerate(plan.steps, 1):
+        cmd_str = " ".join(shlex.quote(a) for a in step["command"])
+        print(f"  {i}. [{step['repo']}] {step['action']}")
+        print(f"     command: {cmd_str}")
+        print(f"     reason:  {step['reason']}")
+    print()
+
+
+def print_plan_json(plan: ExecutionPlan) -> None:
+    obj = {
+        "candidate_commits": plan.candidate_commits,
+        "commit_sources": plan.commit_sources,
+        "changed_repos": plan.changed_repos,
+        "involved_repos": plan.involved_repos,
+        "validated_repos": plan.validated_repos,
+        "steps": plan.steps,
+    }
+    print(json.dumps(obj, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+
+def _short_sha(sha: str) -> str:
+    return sha[:7] if len(sha) >= 7 else sha
+
+
+def _repo_results(summary: dict) -> dict[str, str]:
+    """Derive per-repo validation status from step results.
+
+    Returns a map of repo -> "PASS" | "FAIL" | "BLOCKED" | "NOT RUN"
+    for each validated repo.
+    """
+    validated = set(summary.get("validated_repos", []))
+    # Collect the worst status per repo from executed steps, ignoring
+    # bootstrap/stage_toolchain (those are infra, not validation).
+    repo_status: dict[str, str] = {}
+    for step in summary.get("steps", []):
+        repo = step["repo"]
+        if repo not in validated:
+            continue
+        status = step["status"]
+        if status == "passed":
+            repo_status.setdefault(repo, "PASS")
+        elif status == "failed":
+            repo_status[repo] = "FAIL"
+        elif status == "blocked":
+            repo_status[repo] = "BLOCKED"
+
+    # Repos in validated_repos that never had a step executed are NOT RUN.
+    for repo in summary.get("validated_repos", []):
+        if repo not in repo_status:
+            repo_status[repo] = "NOT RUN"
+
+    return repo_status
+
+
+def _first_failure(summary: dict) -> Optional[dict]:
+    """Find the first failed or blocked step."""
+    for step in summary.get("steps", []):
+        if step["status"] in ("failed", "blocked"):
+            return step
+    return None
+
+
+def _failure_reason(summary: dict) -> str:
+    """Extract a one-line failure reason from summary."""
+    if summary.get("block_reason"):
+        return summary["block_reason"]
+    step = _first_failure(summary)
+    if not step:
+        return "unknown"
+    log_path = Path(step.get("log_path", ""))
+    if log_path.exists():
+        text = log_path.read_text()
+        stderr_section = text.split("--- stderr ---\n", 1)
+        if len(stderr_section) == 2:
+            lines = [l.strip() for l in stderr_section[1].strip().splitlines()
+                     if l.strip()]
+            if lines:
+                # Prefer the first "error:" line over generic wrapper noise
+                # like "error: Recipe `foo` failed on line N with exit code M".
+                error_lines = [l for l in lines
+                               if "error:" in l.lower()
+                               and "Recipe `" not in l]
+                reason = error_lines[0] if error_lines else lines[-1]
+                # Strip file-location prefixes like "<package>:?:?: ".
+                reason = re.sub(r"^<[^>]+>:\S+\s+", "", reason)
+                # Replace absolute paths with basenames for readability.
+                reason = re.sub(r"'/[^']+/([^'/]+)'", r"'\1'", reason)
+                if len(reason) > 120:
+                    reason = reason[:117] + "..."
+                return reason
+    if step["status"] == "blocked":
+        return "command not found"
+    return f"exit code {step.get('status', '?')}"
+
+
+def generate_report(summary: dict) -> str:
+    """Generate report.txt content from a summary dict."""
+    verdict = summary["verdict"].upper()
+    run_id = summary["run_id"]
+    commits = summary.get("candidate_commits", {})
+    sources = summary.get("commit_sources", {})
+    validated = summary.get("validated_repos", [])
+    lock_updated = verdict == "CERTIFIED"
+
+    lines: list[str] = []
+
+    lines.append(f"Certification Result: {verdict}")
+    lines.append("")
+    lines.append(f"Run: {run_id}")
+
+    submitted = [r for r, s in sources.items() if s == "submitted"]
+    lines.append("Submitted commits:")
+    for r in submitted:
+        lines.append(f"  - {r} @ {_short_sha(commits.get(r, '???'))}")
+
+    lines.append("")
+    lines.append("Workspace snapshot:")
+    for r, sha in commits.items():
+        source = sources.get(r, "")
+        label = f" ({source})" if source else ""
+        lines.append(f"  - {r} @ {_short_sha(sha)}{label}")
+
+    repo_results = _repo_results(summary)
+    lines.append("")
+    lines.append("Result by repo:")
+    for r in validated:
+        lines.append(f"  - {r}: {repo_results.get(r, 'NOT RUN')}")
+
+    if verdict in ("REJECTED", "BLOCKED"):
+        fail_step = _first_failure(summary)
+        reason = _failure_reason(summary)
+        lines.append("")
+        lines.append("Failure summary:")
+        if fail_step:
+            lines.append(f"  - {fail_step['repo']}")
+            lines.append(f"    step: {fail_step['name']}")
+            lines.append(f"    reason: {reason}")
+        elif summary.get("block_reason"):
+            lines.append(f"  - {reason}")
+
+        fail_logs = [
+            step["log_path"] for step in summary.get("steps", [])
+            if step["status"] in ("failed", "blocked")
+        ]
+        if fail_logs:
+            lines.append("")
+            lines.append("Logs:")
+            for log in fail_logs:
+                lines.append(f"  - {Path(log).resolve()}")
+
+    lines.append("")
+    lines.append("Lock update:")
+    if lock_updated:
+        lines.append("  - workspace-lock.json updated")
+    else:
+        lines.append("  - workspace-lock.json not updated")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def generate_report_short(summary: dict) -> str:
+    """Generate report-short.txt content from a summary dict."""
+    verdict = summary["verdict"].upper()
+    commits = summary.get("candidate_commits", {})
+    sources = summary.get("commit_sources", {})
+    validated = summary.get("validated_repos", [])
+    lock_updated = verdict == "CERTIFIED"
+
+    submitted = [r for r, s in sources.items() if s == "submitted"]
+    submitted_label = _join_english(
+        [f"{r}@{_short_sha(commits.get(r, '???'))}" for r in submitted]
+    )
+
+    lock_msg = ("workspace-lock.json updated" if lock_updated
+                else "workspace-lock.json not updated")
+
+    if verdict == "CERTIFIED":
+        validated_label = ", ".join(validated)
+        return (f"{verdict}: submitted {submitted_label}. "
+                f"Validated: {validated_label}. {lock_msg}.")
+    else:
+        fail_step = _first_failure(summary)
+        if fail_step:
+            reason = _failure_reason(summary)
+            return (f"{verdict}: submitted {submitted_label}. "
+                    f"First failure: {fail_step['repo']} {fail_step['name']} "
+                    f"({reason}). {lock_msg}.")
+        elif summary.get("block_reason"):
+            return (f"{verdict}: submitted {submitted_label}. "
+                    f"{summary['block_reason']}. {lock_msg}.")
+        else:
+            return f"{verdict}: submitted {submitted_label}. {lock_msg}."
+
+
+def _join_english(items: list[str]) -> str:
+    if len(items) == 0:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+# ---------------------------------------------------------------------------
+# Provenance collection
+# ---------------------------------------------------------------------------
+
+def _parse_version_tuple(version_str: str) -> tuple[int, ...]:
+    """Parse "0.27.94" into (0, 27, 94) for comparison."""
+    try:
+        return tuple(int(x) for x in version_str.split("."))
+    except (ValueError, AttributeError):
+        return (0,)
+
+
+def get_toolchain_version(ctx: "RunContext") -> Optional[str]:
+    """Get the driftc version string from the staged toolchain."""
+    driftc = ctx.toolchain_root / "current" / "bin" / "driftc"
+    if not driftc.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(driftc), "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+
+def toolchain_supports_provenance(version_output: Optional[str]) -> bool:
+    """Check if the staged toolchain is >= 0.27.94."""
+    if not version_output:
+        return False
+    m = re.search(r"driftc\s+([\d.]+)", version_output)
+    if not m:
+        return False
+    return _parse_version_tuple(m.group(1)) >= (0, 27, 94)
+
+
+def scan_staged_artifacts(libs_root: Path) -> list[dict]:
+    """Scan the staged libs root for deployed artifacts.
+
+    Returns a list of artifact records with paths to the artifact,
+    sig, author-profile, and provenance bundle if present.
+    """
+    artifacts: list[str] = []
+    if not libs_root.exists():
+        return []
+
+    results: list[dict] = []
+    for artifact_dir in sorted(libs_root.iterdir()):
+        if not artifact_dir.is_dir():
+            continue
+        artifact_name = artifact_dir.name
+        for version_dir in sorted(artifact_dir.iterdir()):
+            if not version_dir.is_dir():
+                continue
+            version = version_dir.name
+            record: dict = {
+                "name": artifact_name,
+                "version": version,
+            }
+
+            # Look for known artifact files.
+            zdmp = version_dir / f"{artifact_name}.zdmp"
+            sig = version_dir / f"{artifact_name}.sig"
+            author_profile = version_dir / f"{artifact_name}.author-profile"
+            provenance = version_dir / f"{artifact_name}.provenance.zst"
+
+            if zdmp.exists():
+                record["artifact_path"] = str(zdmp)
+            if sig.exists():
+                record["sig_path"] = str(sig)
+            if author_profile.exists():
+                record["author_profile_path"] = str(author_profile)
+            if provenance.exists():
+                record["provenance_path"] = str(provenance)
+                prov_data = _read_provenance_bundle(provenance)
+                if prov_data:
+                    record["provenance"] = prov_data
+            else:
+                record["provenance_path"] = None
+
+            results.append(record)
+
+    return results
+
+
+def _read_provenance_bundle(path: Path) -> Optional[dict]:
+    """Read and parse a .provenance.zst file, extracting key fields."""
+    try:
+        import zstandard
+        compressed = path.read_bytes()
+        dctx = zstandard.ZstdDecompressor()
+        raw = dctx.decompress(compressed)
+        bundle = json.loads(raw)
+        prov = bundle.get("provenance", {})
+        return {
+            "artifact_name": prov.get("artifact_name"),
+            "artifact_version": prov.get("artifact_version"),
+            "artifact_sha256": prov.get("artifact_sha256"),
+            "compiler_version": prov.get("compiler_version"),
+            "compiler_commit": prov.get("compiler_commit"),
+            "abi": prov.get("abi"),
+            "build_utc": prov.get("build_utc"),
+        }
+    except Exception:
+        return None
+
+
+def check_provenance_completeness(
+    artifacts: list[dict], require_provenance: bool
+) -> list[str]:
+    """Check that all artifacts have provenance bundles.
+
+    Returns a list of error messages for missing provenance.
+    """
+    if not require_provenance:
+        return []
+    errors: list[str] = []
+    for art in artifacts:
+        if art.get("provenance_path") is None:
+            errors.append(
+                f"{art['name']}@{art['version']}: missing .provenance.zst"
+            )
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Run execution
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunContext:
+    run_id: str
+    run_root: Path
+    checkouts_root: Path
+    toolchain_root: Path
+    libs_root: Path
+    logs_root: Path
+
+
+def create_run_context(config: OrchestrationConfig, plan: ExecutionPlan) -> RunContext:
+    """Create the run directory structure."""
+    now = datetime.now(timezone.utc)
+    # Use first changed repo + short SHA for human-readable run ID.
+    first_changed = plan.changed_repos[0]
+    first_sha = plan.candidate_commits[first_changed][:7]
+    run_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{first_changed}-{first_sha}"
+
+    run_root = Path(config.run_root) / run_id
+    ctx = RunContext(
+        run_id=run_id,
+        run_root=run_root,
+        checkouts_root=run_root / "checkouts",
+        toolchain_root=run_root / "toolchain",
+        libs_root=run_root / "libs",
+        logs_root=run_root / "logs",
+    )
+
+    for d in [ctx.checkouts_root, ctx.toolchain_root, ctx.libs_root, ctx.logs_root]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    return ctx
+
+
+def materialize_checkout(
+    repo: RepoConfig, sha: str, checkouts_root: Path
+) -> Path:
+    """Clone a repo and check out the exact commit SHA."""
+    checkout_dir = checkouts_root / repo.name
+
+    # Clone from the sibling repo on disk (local clone, no network).
+    source = str(Path(repo.path).resolve())
+    result = subprocess.run(
+        ["git", "clone", "--no-checkout", source, str(checkout_dir)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git clone failed for {repo.name}: {result.stderr.strip()}"
+        )
+
+    result = subprocess.run(
+        ["git", "checkout", sha],
+        cwd=checkout_dir, capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git checkout {sha} failed for {repo.name}: {result.stderr.strip()}"
+        )
+
+    return checkout_dir
+
+
+def resolve_placeholders(
+    argv: list[str], ctx: RunContext
+) -> list[str]:
+    """Substitute staging path placeholders in a command argv."""
+    subs = {
+        "{toolchain_root}": str(ctx.toolchain_root.resolve()),
+        "{libs_root}": str(ctx.libs_root.resolve()),
+        "{staged_drift}": str((ctx.toolchain_root / "current" / "bin" / "drift").resolve()),
+        "{staged_driftc}": str((ctx.toolchain_root / "current" / "bin" / "driftc").resolve()),
+    }
+    resolved = []
+    for arg in argv:
+        for placeholder, value in subs.items():
+            arg = arg.replace(placeholder, value)
+        resolved.append(arg)
+    return resolved
+
+
+def build_step_env(
+    config: OrchestrationConfig, ctx: RunContext
+) -> dict[str, str]:
+    """Build environment variables for step execution.
+
+    The staged toolchain bin directory is prepended to PATH so that
+    repo test recipes that invoke bare `drift` or `driftc` resolve
+    to the staged toolchain rather than any ambient installation.
+    """
+    env = dict(os.environ)
+    toolchain_root = str(ctx.toolchain_root.resolve())
+    libs_root = str(ctx.libs_root.resolve())
+
+    subs = {
+        "{toolchain_root}": toolchain_root,
+        "{libs_root}": libs_root,
+    }
+    for var, template in config.environment.get("vars", {}).items():
+        value = template
+        for placeholder, resolved in subs.items():
+            value = value.replace(placeholder, resolved)
+        env[var] = value
+
+    # Prepend staged toolchain bin to PATH so repo-owned test recipes
+    # that call bare `drift` or `driftc` use the staged build.
+    staged_bin = str((ctx.toolchain_root / "current" / "bin").resolve())
+    env["PATH"] = staged_bin + os.pathsep + env.get("PATH", "")
+
+    return env
+
+
+def execute_run(
+    config: OrchestrationConfig, plan: ExecutionPlan
+) -> dict:
+    """Execute the full certification run. Returns the summary dict."""
+    started_at = datetime.now(timezone.utc)
+    ctx = create_run_context(config, plan)
+
+    print(f"Run: {ctx.run_id}")
+    print(f"Dir: {ctx.run_root}")
+    print()
+
+    # Materialize fresh checkouts for all involved repos.
+    checkout_dirs: dict[str, Path] = {}
+    for repo_name in plan.involved_repos:
+        repo = config.repos[repo_name]
+        sha = plan.candidate_commits[repo_name]
+        short = sha[:7]
+        print(f"  checkout {repo_name} @ {short} ...", end=" ", flush=True)
+        try:
+            checkout_dirs[repo_name] = materialize_checkout(
+                repo, sha, ctx.checkouts_root
+            )
+            print("ok")
+        except RuntimeError as e:
+            print("FAILED")
+            print(f"  {e}", file=sys.stderr)
+            summary = _build_summary(
+                ctx, config, plan, started_at, "blocked",
+                steps_results=[], block_reason=str(e),
+            )
+            _write_run_outputs(ctx, summary)
+            return summary
+    print()
+
+    # Execute steps.
+    step_env = build_step_env(config, ctx)
+    step_results: list[dict] = []
+    verdict = "certified"
+
+    for step in plan.steps:
+        repo_name = step["repo"]
+        action = step["action"]
+        raw_cmd = step["command"]
+        resolved_cmd = resolve_placeholders(raw_cmd, ctx)
+        cwd = checkout_dirs[repo_name]
+        log_file = ctx.logs_root / f"{repo_name}.{action}.log"
+
+        label = f"[{repo_name}] {action}"
+        print(f"  {label} ...", end=" ", flush=True)
+
+        step_started = datetime.now(timezone.utc)
+        try:
+            result = subprocess.run(
+                resolved_cmd, cwd=cwd, env=step_env,
+                capture_output=True, text=True, timeout=600,
+            )
+            log_file.write_text(
+                f"=== {label} ===\n"
+                f"command: {resolved_cmd}\n"
+                f"cwd: {cwd}\n"
+                f"exit: {result.returncode}\n\n"
+                f"--- stdout ---\n{result.stdout}\n"
+                f"--- stderr ---\n{result.stderr}\n"
+            )
+            step_finished = datetime.now(timezone.utc)
+
+            if result.returncode == 0:
+                status = "passed"
+                print("ok")
+            else:
+                status = "failed"
+                verdict = "rejected"
+                print("FAILED")
+                print(f"    see: {log_file}")
+        except subprocess.TimeoutExpired:
+            step_finished = datetime.now(timezone.utc)
+            status = "failed"
+            verdict = "rejected"
+            log_file.write_text(f"=== {label} ===\nTIMEOUT after 600s\n")
+            print("TIMEOUT")
+        except FileNotFoundError as e:
+            step_finished = datetime.now(timezone.utc)
+            status = "blocked"
+            verdict = "blocked"
+            log_file.write_text(f"=== {label} ===\ncommand not found: {e}\n")
+            print("BLOCKED (command not found)")
+
+        step_results.append({
+            "repo": repo_name,
+            "name": action,
+            "status": status,
+            "command": resolved_cmd,
+            "log_path": str(log_file),
+            "started_at": step_started.isoformat(),
+            "finished_at": step_finished.isoformat(),
+        })
+
+        # Fail fast: stop on first failure.
+        if status in ("failed", "blocked"):
+            break
+
+    print()
+
+    # Collect artifact provenance from staged libs.
+    toolchain_version = get_toolchain_version(ctx)
+    require_provenance = toolchain_supports_provenance(toolchain_version)
+    artifacts = scan_staged_artifacts(ctx.libs_root)
+
+    if artifacts and verdict == "certified":
+        prov_errors = check_provenance_completeness(artifacts, require_provenance)
+        if prov_errors:
+            verdict = "rejected"
+            print("Provenance check failed:")
+            for err in prov_errors:
+                print(f"  - {err}")
+            print()
+
+    summary = _build_summary(
+        ctx, config, plan, started_at, verdict, step_results,
+        toolchain_version=toolchain_version,
+        artifacts=artifacts,
+    )
+
+    _write_run_outputs(ctx, summary)
+
+    # Update workspace-lock.json only on certified verdict.
+    if verdict == "certified":
+        _update_workspace_lock(config, plan, ctx, summary)
+
+    print(f"Verdict: {verdict}")
+    return summary
+
+
+def _write_run_outputs(ctx: RunContext, summary: dict) -> None:
+    """Write summary.json, report.txt, and report-short.txt."""
+    summary_json_path = ctx.run_root / "summary.json"
+    summary_json_path.write_text(json.dumps(summary, indent=2) + "\n")
+
+    report_path = ctx.run_root / "report.txt"
+    report_path.write_text(generate_report(summary))
+
+    report_short_path = ctx.run_root / "report-short.txt"
+    report_short_path.write_text(generate_report_short(summary) + "\n")
+
+    print(f"Summary: {summary_json_path}")
+    print(f"Report:  {report_path}")
+    print(f"Short:   {report_short_path}")
+
+
+def _resolve_toolchain_identity(ctx: RunContext) -> Optional[dict]:
+    """Read the staged toolchain version and paths if available."""
+    current_link = ctx.toolchain_root / "current"
+    if not current_link.exists():
+        return None
+    # The symlink target is the versioned directory name, e.g. "drift-0.27.92+abi6".
+    target = current_link.resolve()
+    drift_bin = target / "bin" / "drift"
+    driftc_bin = target / "bin" / "driftc"
+    identity: dict = {"directory": target.name}
+    # Try to get the version from driftc --version.
+    if driftc_bin.exists():
+        try:
+            result = subprocess.run(
+                [str(driftc_bin), "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                identity["driftc_version"] = result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        identity["driftc"] = str(driftc_bin)
+    if drift_bin.exists():
+        identity["drift"] = str(drift_bin)
+    return identity
+
+
+def _build_summary(
+    ctx: RunContext,
+    config: OrchestrationConfig,
+    plan: ExecutionPlan,
+    started_at: datetime,
+    verdict: str,
+    steps_results: list[dict],
+    block_reason: Optional[str] = None,
+    toolchain_version: Optional[str] = None,
+    artifacts: Optional[list[dict]] = None,
+) -> dict:
+    finished_at = datetime.now(timezone.utc)
+    summary: dict = {
+        "schema_version": 1,
+        "run_id": ctx.run_id,
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "verdict": verdict,
+        "changed_repos": plan.changed_repos,
+        "candidate_commits": plan.candidate_commits,
+        "commit_sources": plan.commit_sources,
+        "involved_repos": plan.involved_repos,
+        "validated_repos": plan.validated_repos,
+        "staging": {
+            "run_root": str(ctx.run_root),
+            "toolchain_root": str(ctx.toolchain_root),
+            "libs_root": str(ctx.libs_root),
+            "logs_root": str(ctx.logs_root),
+            "toolchain_identity": _resolve_toolchain_identity(ctx),
+        },
+        "steps": steps_results,
+    }
+    if toolchain_version:
+        summary["toolchain_version"] = toolchain_version
+    if artifacts:
+        summary["artifacts"] = artifacts
+    if block_reason:
+        summary["block_reason"] = block_reason
+    return summary
+
+
+def _update_workspace_lock(
+    config: OrchestrationConfig,
+    plan: ExecutionPlan,
+    ctx: RunContext,
+    summary: dict,
+) -> None:
+    lock_path = Path(config.state_root) / "workspace-lock.json"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_data = {
+        "schema_version": 1,
+        "updated_at": summary["finished_at"],
+        "source_run_id": ctx.run_id,
+        "verdict": "certified",
+        "changed_repos": plan.changed_repos,
+        "repos": {},
+    }
+    for name, sha in plan.candidate_commits.items():
+        lock_data["repos"][name] = {
+            "path": config.repos[name].path,
+            "commit": sha,
+        }
+
+    lock_path.write_text(json.dumps(lock_data, indent=2) + "\n")
+    print(f"Updated: {lock_path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Workspace certification orchestrator"
+    )
+    parser.add_argument(
+        "--config",
+        default="orchestration.json",
+        help="Path to orchestration.json",
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    plan_parser = sub.add_parser("plan", help="Compute and display execution plan")
+    plan_parser.add_argument(
+        "input_file",
+        help="JSON file mapping repo names to candidate commit SHAs",
+    )
+    plan_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output plan as JSON",
+    )
+
+    run_parser = sub.add_parser("run", help="Execute a certification run")
+    run_parser.add_argument(
+        "input_file",
+        help="JSON file mapping repo names to candidate commit SHAs",
+    )
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    config_path = Path(args.config)
+    if not config_path.exists():
+        print(f"error: config not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+
+    config = OrchestrationConfig.load(config_path)
+
+    if args.command in ("plan", "run"):
+        plan = _load_and_plan(config, args.input_file)
+        if plan is None:
+            sys.exit(0)
+
+        if args.command == "plan":
+            if args.json:
+                print_plan_json(plan)
+            else:
+                print_plan(plan, config)
+        else:
+            summary = execute_run(config, plan)
+            sys.exit(0 if summary["verdict"] == "certified" else 1)
+
+
+def _load_and_plan(
+    config: OrchestrationConfig, input_file: str
+) -> Optional[ExecutionPlan]:
+    """Shared input validation and plan computation for plan/run commands."""
+    input_path = Path(input_file)
+    if not input_path.exists():
+        print(f"error: commit input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    submitted = load_commit_input(input_path)
+
+    unknown = [n for n in submitted if n not in config.repos]
+    if unknown:
+        print(f"error: unknown repos in input: {', '.join(unknown)}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    validate_shas(submitted)
+
+    lock_path = Path(config.state_root) / "workspace-lock.json"
+    lock = WorkspaceLock.load(lock_path)
+
+    commits, sources = resolve_commits(config, submitted, lock)
+    changed = detect_changed(commits, lock)
+
+    if not changed:
+        print("No repos changed relative to certified snapshot.")
+        return None
+
+    return compute_plan(config, commits, sources, changed)
+
+
+if __name__ == "__main__":
+    main()
