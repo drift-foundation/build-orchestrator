@@ -27,6 +27,8 @@
       "affects": [],
       "commands": {
         "test": ["just", "test"],
+        "stress": ["just", "stress"],
+        "perf": ["just", "perf"],
         "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
       }
     },
@@ -37,6 +39,8 @@
       "affects": ["drift-web"],
       "commands": {
         "test": ["just", "test"],
+        "stress": ["just", "stress"],
+        "perf": ["just", "perf"],
         "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
       }
     },
@@ -47,6 +51,8 @@
       "affects": [],
       "commands": {
         "test": ["just", "test"],
+        "stress": ["just", "stress"],
+        "perf": ["just", "perf"],
         "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
       }
     }
@@ -56,6 +62,7 @@
     "driftc_rel": "bin/driftc",
     "drift_rel": "bin/drift",
     "vars": {
+      "DRIFT_TOOLCHAIN_ROOT": "{toolchain_root}/current",
       "DRIFTC": "{toolchain_root}/current/bin/driftc",
       "DRIFT_PACKAGE_ROOT": "{libs_root}",
       "DRIFT_PKG_ROOT": "{libs_root}"

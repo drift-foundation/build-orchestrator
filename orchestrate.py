@@ -40,6 +40,7 @@ class OrchestrationConfig:
     state_root: str
     repos: dict[str, RepoConfig]
     environment: dict
+    config_name: str = "orchestration"
 
     @staticmethod
     def load(path: Path) -> "OrchestrationConfig":
@@ -54,6 +55,8 @@ class OrchestrationConfig:
                 affects=r.get("affects", []),
                 commands=r.get("commands", {}),
             )
+        # Derive config_name from the filename, stripping .json.
+        config_name = path.stem
         return OrchestrationConfig(
             schema_version=raw["schema_version"],
             workspace_root=raw["workspace"]["root"],
@@ -61,7 +64,16 @@ class OrchestrationConfig:
             state_root=raw["workspace"]["state_root"],
             repos=repos,
             environment=raw.get("environment", {}),
+            config_name=config_name,
         )
+
+    @property
+    def lock_filename(self) -> str:
+        return f"{self.config_name}.workspace-lock.json"
+
+    @property
+    def lock_path(self) -> Path:
+        return Path(self.state_root) / self.lock_filename
 
 
 @dataclass
@@ -225,7 +237,7 @@ def resolve_commits(
             f"error: no commit specified and no certified snapshot for: "
             f"{', '.join(missing)}\n"
             f"hint: add these repos to your commit input file "
-            f"or create an initial state/workspace-lock.json",
+            f"or create an initial {config.lock_filename}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -311,14 +323,16 @@ def compute_plan(
                 "reason": reason,
             })
         if repo_name in validated:
-            if "test" in repo.commands:
-                steps.append({
-                    "repo": repo_name,
-                    "action": "test",
-                    "command": repo.commands["test"],
-                    "reason": "directly changed" if repo_name in changed
-                        else f"depends on {_dep_reason(repo, changed)}",
-                })
+            validation_reason = ("directly changed" if repo_name in changed
+                                 else f"depends on {_dep_reason(repo, changed)}")
+            for gate in ("test", "stress", "perf"):
+                if gate in repo.commands:
+                    steps.append({
+                        "repo": repo_name,
+                        "action": gate,
+                        "command": repo.commands[gate],
+                        "reason": validation_reason,
+                    })
 
     return ExecutionPlan(
         candidate_commits=commits,
@@ -480,6 +494,7 @@ def generate_report(summary: dict) -> str:
     commits = summary.get("candidate_commits", {})
     sources = summary.get("commit_sources", {})
     validated = summary.get("validated_repos", [])
+    lock_file = summary.get("lock_file", "workspace-lock.json")
     lock_updated = verdict == "CERTIFIED"
 
     lines: list[str] = []
@@ -528,12 +543,29 @@ def generate_report(summary: dict) -> str:
             for log in fail_logs:
                 lines.append(f"  - {Path(log).resolve()}")
 
+    contract = summary.get("toolchain_contract")
+    if contract:
+        lines.append("")
+        lines.append("Toolchain contract:")
+        lines.append(f"  DRIFT_TOOLCHAIN_ROOT: {contract['DRIFT_TOOLCHAIN_ROOT']}")
+        lines.append(f"  ambient toolchain scrubbed: {contract['ambient_scrubbed']}")
+        # Flag any gate-level contract violations.
+        violations = [
+            s for s in summary.get("steps", [])
+            if s.get("contract_violation")
+        ]
+        if violations:
+            lines.append("  contract violations:")
+            for v in violations:
+                lines.append(f"    - {v['repo']} {v['name']}: "
+                             "not resolving from DRIFT_TOOLCHAIN_ROOT")
+
     lines.append("")
     lines.append("Lock update:")
     if lock_updated:
-        lines.append("  - workspace-lock.json updated")
+        lines.append(f"  - {lock_file} updated")
     else:
-        lines.append("  - workspace-lock.json not updated")
+        lines.append(f"  - {lock_file} not updated")
     lines.append("")
 
     return "\n".join(lines)
@@ -545,6 +577,7 @@ def generate_report_short(summary: dict) -> str:
     commits = summary.get("candidate_commits", {})
     sources = summary.get("commit_sources", {})
     validated = summary.get("validated_repos", [])
+    lock_file = summary.get("lock_file", "workspace-lock.json")
     lock_updated = verdict == "CERTIFIED"
 
     submitted = [r for r, s in sources.items() if s == "submitted"]
@@ -552,8 +585,8 @@ def generate_report_short(summary: dict) -> str:
         [f"{r}@{_short_sha(commits.get(r, '???'))}" for r in submitted]
     )
 
-    lock_msg = ("workspace-lock.json updated" if lock_updated
-                else "workspace-lock.json not updated")
+    lock_msg = (f"{lock_file} updated" if lock_updated
+                else f"{lock_file} not updated")
 
     if verdict == "CERTIFIED":
         validated_label = ", ".join(validated)
@@ -796,14 +829,39 @@ def resolve_placeholders(
     return resolved
 
 
+_CERTIFICATION_GATES = frozenset(("test", "stress", "perf"))
+
+
+def _scrub_ambient_toolchain(path_value: str, staged_bin: str) -> str:
+    """Remove PATH entries that contain ambient drift/driftc binaries.
+
+    Keeps only the staged toolchain bin and entries that do NOT contain
+    a ``drift`` or ``driftc`` binary, so certification gates cannot
+    accidentally resolve tools from a production or user-local install.
+    """
+    kept: list[str] = []
+    for entry in path_value.split(os.pathsep):
+        if not entry:
+            continue
+        if entry == staged_bin:
+            kept.append(entry)
+            continue
+        entry_path = Path(entry)
+        if (entry_path / "drift").exists() or (entry_path / "driftc").exists():
+            continue  # ambient toolchain — drop
+        kept.append(entry)
+    return os.pathsep.join(kept)
+
+
 def build_step_env(
-    config: OrchestrationConfig, ctx: RunContext
+    config: OrchestrationConfig, ctx: RunContext, *, gate: bool = False,
 ) -> dict[str, str]:
     """Build environment variables for step execution.
 
-    The staged toolchain bin directory is prepended to PATH so that
-    repo test recipes that invoke bare `drift` or `driftc` resolve
-    to the staged toolchain rather than any ambient installation.
+    When *gate* is True the environment is hardened for certification:
+    ambient PATH entries that contain ``drift`` or ``driftc`` are removed
+    so that downstream recipes can only succeed if they resolve tooling
+    from ``DRIFT_TOOLCHAIN_ROOT``.
     """
     env = dict(os.environ)
     toolchain_root = str(ctx.toolchain_root.resolve())
@@ -819,10 +877,18 @@ def build_step_env(
             value = value.replace(placeholder, resolved)
         env[var] = value
 
-    # Prepend staged toolchain bin to PATH so repo-owned test recipes
-    # that call bare `drift` or `driftc` use the staged build.
     staged_bin = str((ctx.toolchain_root / "current" / "bin").resolve())
-    env["PATH"] = staged_bin + os.pathsep + env.get("PATH", "")
+
+    if gate:
+        # Certification gates: scrub ambient drift/driftc from PATH so
+        # repos that depend on PATH instead of DRIFT_TOOLCHAIN_ROOT fail.
+        scrubbed = _scrub_ambient_toolchain(
+            env.get("PATH", ""), staged_bin,
+        )
+        env["PATH"] = staged_bin + os.pathsep + scrubbed
+    else:
+        # Infra steps (bootstrap, stage_*): keep full PATH for flexibility.
+        env["PATH"] = staged_bin + os.pathsep + env.get("PATH", "")
 
     return env
 
@@ -862,7 +928,8 @@ def execute_run(
     print()
 
     # Execute steps.
-    step_env = build_step_env(config, ctx)
+    infra_env = build_step_env(config, ctx, gate=False)
+    gate_env = build_step_env(config, ctx, gate=True)
     step_results: list[dict] = []
     verdict = "certified"
 
@@ -873,23 +940,56 @@ def execute_run(
         resolved_cmd = resolve_placeholders(raw_cmd, ctx)
         cwd = checkout_dirs[repo_name]
         log_file = ctx.logs_root / f"{repo_name}.{action}.log"
+        is_gate = action in _CERTIFICATION_GATES
 
         label = f"[{repo_name}] {action}"
         print(f"  {label} ...", end=" ", flush=True)
 
+        step_env = gate_env if is_gate else infra_env
         step_started = datetime.now(timezone.utc)
+        contract_violation = False
         try:
             result = subprocess.run(
                 resolved_cmd, cwd=cwd, env=step_env,
                 capture_output=True, text=True, timeout=600,
             )
+
+            # Detect contract violation: if a gate step failed and its
+            # output mentions missing drift/driftc commands, the repo is
+            # likely resolving from ambient PATH instead of
+            # DRIFT_TOOLCHAIN_ROOT.
+            combined_output = result.stdout + result.stderr
+            if is_gate and result.returncode != 0:
+                for marker in ("drift: not found", "driftc: not found",
+                               "drift: command not found",
+                               "driftc: command not found",
+                               "No such file or directory"):
+                    if marker in combined_output:
+                        contract_violation = True
+                        break
+
+            violation_note = ""
+            if contract_violation:
+                violation_note = (
+                    "\n\n--- contract violation ---\n"
+                    "Gate failed because tooling was not resolved from "
+                    "DRIFT_TOOLCHAIN_ROOT.\n"
+                    "The repo recipe must use $DRIFT_TOOLCHAIN_ROOT/bin/drift "
+                    "and $DRIFT_TOOLCHAIN_ROOT/bin/driftc instead of relying "
+                    "on ambient PATH.\n"
+                )
+
             log_file.write_text(
                 f"=== {label} ===\n"
                 f"command: {resolved_cmd}\n"
                 f"cwd: {cwd}\n"
-                f"exit: {result.returncode}\n\n"
+                f"exit: {result.returncode}\n"
+                f"certification_gate: {is_gate}\n"
+                f"DRIFT_TOOLCHAIN_ROOT: {step_env.get('DRIFT_TOOLCHAIN_ROOT', 'NOT SET')}\n"
+                f"\n"
                 f"--- stdout ---\n{result.stdout}\n"
                 f"--- stderr ---\n{result.stderr}\n"
+                f"{violation_note}"
             )
             step_finished = datetime.now(timezone.utc)
 
@@ -899,7 +999,10 @@ def execute_run(
             else:
                 status = "failed"
                 verdict = "rejected"
-                print("FAILED")
+                if contract_violation:
+                    print("FAILED (contract violation: not using DRIFT_TOOLCHAIN_ROOT)")
+                else:
+                    print("FAILED")
                 print(f"    see: {log_file}")
         except subprocess.TimeoutExpired:
             step_finished = datetime.now(timezone.utc)
@@ -914,7 +1017,7 @@ def execute_run(
             log_file.write_text(f"=== {label} ===\ncommand not found: {e}\n")
             print("BLOCKED (command not found)")
 
-        step_results.append({
+        step_record: dict = {
             "repo": repo_name,
             "name": action,
             "status": status,
@@ -922,7 +1025,14 @@ def execute_run(
             "log_path": str(log_file),
             "started_at": step_started.isoformat(),
             "finished_at": step_finished.isoformat(),
-        })
+        }
+        if is_gate:
+            step_record["certification_gate"] = True
+            step_record["DRIFT_TOOLCHAIN_ROOT"] = step_env.get(
+                "DRIFT_TOOLCHAIN_ROOT", None)
+            if contract_violation:
+                step_record["contract_violation"] = True
+        step_results.append(step_record)
 
         # Fail fast: stop on first failure.
         if status in ("failed", "blocked"):
@@ -952,7 +1062,7 @@ def execute_run(
 
     _write_run_outputs(ctx, summary)
 
-    # Update workspace-lock.json only on certified verdict.
+    # Update the config-scoped workspace lock only on certified verdict.
     if verdict == "certified":
         _update_workspace_lock(config, plan, ctx, summary)
 
@@ -1018,6 +1128,8 @@ def _build_summary(
     summary: dict = {
         "schema_version": 1,
         "run_id": ctx.run_id,
+        "config_name": config.config_name,
+        "lock_file": str(config.lock_path),
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
         "verdict": verdict,
@@ -1032,6 +1144,14 @@ def _build_summary(
             "libs_root": str(ctx.libs_root),
             "logs_root": str(ctx.logs_root),
             "toolchain_identity": _resolve_toolchain_identity(ctx),
+        },
+        "toolchain_contract": {
+            "DRIFT_TOOLCHAIN_ROOT": str(
+                (ctx.toolchain_root / "current").resolve()
+            ),
+            "ambient_scrubbed": True,
+            "enforcement": "certification gates ran with ambient "
+                           "drift/driftc removed from PATH",
         },
         "steps": steps_results,
     }
@@ -1050,7 +1170,7 @@ def _update_workspace_lock(
     ctx: RunContext,
     summary: dict,
 ) -> None:
-    lock_path = Path(config.state_root) / "workspace-lock.json"
+    lock_path = config.lock_path
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     lock_data = {
@@ -1150,8 +1270,7 @@ def _load_and_plan(
 
     validate_shas(submitted)
 
-    lock_path = Path(config.state_root) / "workspace-lock.json"
-    lock = WorkspaceLock.load(lock_path)
+    lock = WorkspaceLock.load(config.lock_path)
 
     commits, sources = resolve_commits(config, submitted, lock)
     changed = detect_changed(commits, lock)
