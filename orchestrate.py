@@ -1107,8 +1107,29 @@ def execute_run(
     return summary
 
 
+def _generate_artifacts_txt(summary: dict) -> str:
+    """Generate artifacts.txt listing all produced artifact paths."""
+    lines: list[str] = []
+    artifacts = summary.get("artifacts", [])
+    if not artifacts:
+        lines.append("No artifacts produced.")
+        return "\n".join(lines) + "\n"
+
+    for art in artifacts:
+        lines.append(f"{art['name']}@{art['version']}")
+        for key in ("artifact_path", "sig_path", "author_profile_path",
+                     "provenance_path"):
+            path = art.get(key)
+            if path:
+                label = key.replace("_path", "").replace("_", " ")
+                lines.append(f"  {label}: {path}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _write_run_outputs(ctx: RunContext, summary: dict) -> None:
-    """Write summary.json, report.txt, and report-short.txt."""
+    """Write summary.json, report.txt, report-short.txt, and artifacts.txt."""
     summary_json_path = ctx.run_root / "summary.json"
     summary_json_path.write_text(json.dumps(summary, indent=2) + "\n")
 
@@ -1118,9 +1139,13 @@ def _write_run_outputs(ctx: RunContext, summary: dict) -> None:
     report_short_path = ctx.run_root / "report-short.txt"
     report_short_path.write_text(generate_report_short(summary) + "\n")
 
-    print(f"Summary: {summary_json_path}")
-    print(f"Report:  {report_path}")
-    print(f"Short:   {report_short_path}")
+    artifacts_path = ctx.run_root / "artifacts.txt"
+    artifacts_path.write_text(_generate_artifacts_txt(summary))
+
+    print(f"Summary:   {summary_json_path}")
+    print(f"Report:    {report_path}")
+    print(f"Short:     {report_short_path}")
+    print(f"Artifacts: {artifacts_path}")
 
 
 def _resolve_toolchain_identity(ctx: RunContext) -> Optional[dict]:
@@ -1388,10 +1413,42 @@ def promote_run(run_id: str, dest_root: Path) -> int:
     shutil.copytree(source_libs_root, snapshot_libs, symlinks=True)
 
     # Copy certification metadata into the snapshot.
-    for name in ("summary.json", "report.txt", "report-short.txt", "artifacts.txt"):
+    for name in ("summary.json", "report.txt", "report-short.txt"):
         src = run_root / name
         if src.exists():
             shutil.copy2(src, snapshot_dir / name)
+
+    # Copy the canonical workspace lock into the snapshot.
+    lock_file = summary.get("lock_file", "")
+    if lock_file:
+        lock_src = Path(lock_file)
+        if lock_src.exists():
+            shutil.copy2(lock_src, snapshot_dir / "workspace-lock.json")
+
+    # Generate snapshot-local artifacts.txt by re-rooting actual artifact
+    # paths from the summary relative to the snapshot's libs/ directory.
+    artifacts = summary.get("artifacts", [])
+    libs_root_str = staging.get("libs_root", "")
+    art_lines: list[str] = []
+    if artifacts:
+        for art in artifacts:
+            art_lines.append(f"{art['name']}@{art['version']}")
+            for key in ("artifact_path", "sig_path",
+                        "author_profile_path", "provenance_path"):
+                src_path = art.get(key, "")
+                if not src_path:
+                    continue
+                label = key.replace("_path", "").replace("_", " ")
+                # Re-root: strip the run-local libs root, prefix with libs/
+                if libs_root_str and src_path.startswith(libs_root_str):
+                    rel = src_path[len(libs_root_str):].lstrip("/")
+                    art_lines.append(f"  {label}: libs/{rel}")
+                else:
+                    art_lines.append(f"  {label}: {src_path}")
+            art_lines.append("")
+    else:
+        art_lines.append("No artifacts produced.")
+    (snapshot_dir / "artifacts.txt").write_text("\n".join(art_lines) + "\n")
 
     # Update the certified/current convenience symlink.
     current_symlink = resolved_dest / "certified" / "current"
