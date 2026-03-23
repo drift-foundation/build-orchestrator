@@ -14,9 +14,12 @@ full stack passes.
 - materializes fresh checkouts for all involved repos
 - stages the candidate Drift toolchain
 - stages downstream package artifacts into a candidate package root
-- runs repo-owned `just test` flows in a controlled staged environment
+- runs repo-owned certification gates (`just test`, `just stress`, `just perf`)
+  in a hardened environment with `DRIFT_TOOLCHAIN_ROOT` and ambient toolchain
+  scrubbing
 - records run evidence, reports, and artifact locations
-- updates `state/workspace-lock.json` only on certified runs
+- updates the config-scoped workspace lock only on certified runs
+- promotes certified runs into immutable snapshot-scoped destinations
 
 ## Current Workspace
 
@@ -36,7 +39,8 @@ Primary inputs:
 
 - `orchestration.json` — workspace graph and command contract
 - commit input JSON — submitted candidate commits for the run
-- `state/workspace-lock.json` — last certified workspace snapshot
+- `state/<config>.workspace-lock.json` — last certified workspace snapshot
+  (scoped by config filename)
 
 Primary outputs per run:
 
@@ -45,13 +49,44 @@ Primary outputs per run:
 - `summary.json`
 - `artifacts.txt`
 
-## Development
-
-The driver is implemented in Python:
+## Usage
 
 ```bash
-./orchestrate.py --config orchestration.json plan path/to/commits.json
+# Plan a run (dry run, no execution):
+./orchestrate.py plan path/to/commits.json
+
+# Execute a certification run:
+./orchestrate.py certify path/to/commits.json
+
+# Promote a certified run into the certified snapshot tree:
+./orchestrate.py promote <run-id>
+./orchestrate.py promote <run-id> --dest-root ~/opt/drift
 ```
+
+`plan` and `certify` require `--config` (defaults to `orchestration.json`).
+`promote` does not — it operates solely from the run's `summary.json`.
+
+### Promotion
+
+Promotion publishes a certified run's exact outputs into an immutable
+snapshot-scoped directory:
+
+```text
+~/opt/drift/certified/
+  snapshots/
+    <run-id>/
+      toolchain/          # staged toolchain (with current symlink)
+      libs/               # staged package artifacts
+      summary.json        # certification evidence
+      report.txt
+      report-short.txt
+      artifacts.txt
+  current -> snapshots/<run-id>
+```
+
+- The run ID is the certification identity — not the version string
+- Snapshots are immutable; promoting the same run-id twice is rejected
+- `certified/current` is a convenience symlink to the latest promoted snapshot
 
 Certification runs operate on:
 

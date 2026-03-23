@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from collections import deque
@@ -543,6 +544,12 @@ def generate_report(summary: dict) -> str:
             for log in fail_logs:
                 lines.append(f"  - {Path(log).resolve()}")
 
+    commit_mismatch = summary.get("toolchain_commit_mismatch")
+    if commit_mismatch:
+        lines.append("")
+        lines.append("Toolchain identity warning:")
+        lines.append(f"  {commit_mismatch}")
+
     contract = summary.get("toolchain_contract")
     if contract:
         lines.append("")
@@ -948,68 +955,86 @@ def execute_run(
         step_env = gate_env if is_gate else infra_env
         step_started = datetime.now(timezone.utc)
         contract_violation = False
+        returncode: Optional[int] = None
+        timed_out = False
+
         try:
-            result = subprocess.run(
-                resolved_cmd, cwd=cwd, env=step_env,
-                capture_output=True, text=True, timeout=600,
-            )
-
-            # Detect contract violation: if a gate step failed and its
-            # output mentions missing drift/driftc commands, the repo is
-            # likely resolving from ambient PATH instead of
-            # DRIFT_TOOLCHAIN_ROOT.
-            combined_output = result.stdout + result.stderr
-            if is_gate and result.returncode != 0:
-                for marker in ("drift: not found", "driftc: not found",
-                               "drift: command not found",
-                               "driftc: command not found",
-                               "No such file or directory"):
-                    if marker in combined_output:
-                        contract_violation = True
-                        break
-
-            violation_note = ""
-            if contract_violation:
-                violation_note = (
-                    "\n\n--- contract violation ---\n"
-                    "Gate failed because tooling was not resolved from "
-                    "DRIFT_TOOLCHAIN_ROOT.\n"
-                    "The repo recipe must use $DRIFT_TOOLCHAIN_ROOT/bin/drift "
-                    "and $DRIFT_TOOLCHAIN_ROOT/bin/driftc instead of relying "
-                    "on ambient PATH.\n"
+            with open(log_file, "w") as lf:
+                # Write header immediately so `tail -f` shows context.
+                lf.write(
+                    f"=== {label} ===\n"
+                    f"command: {resolved_cmd}\n"
+                    f"cwd: {cwd}\n"
+                    f"certification_gate: {is_gate}\n"
+                    f"DRIFT_TOOLCHAIN_ROOT: "
+                    f"{step_env.get('DRIFT_TOOLCHAIN_ROOT', 'NOT SET')}\n"
+                    f"\n"
+                    f"--- output ---\n"
                 )
+                lf.flush()
 
-            log_file.write_text(
-                f"=== {label} ===\n"
-                f"command: {resolved_cmd}\n"
-                f"cwd: {cwd}\n"
-                f"exit: {result.returncode}\n"
-                f"certification_gate: {is_gate}\n"
-                f"DRIFT_TOOLCHAIN_ROOT: {step_env.get('DRIFT_TOOLCHAIN_ROOT', 'NOT SET')}\n"
-                f"\n"
-                f"--- stdout ---\n{result.stdout}\n"
-                f"--- stderr ---\n{result.stderr}\n"
-                f"{violation_note}"
-            )
+                proc = subprocess.Popen(
+                    resolved_cmd, cwd=cwd, env=step_env,
+                    stdout=lf, stderr=subprocess.STDOUT,
+                )
+                try:
+                    proc.wait(timeout=600)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    proc.kill()
+                    proc.wait()
+
+                returncode = proc.returncode
+
+                # Append trailer.
+                lf.write(f"\n--- end ---\n")
+                if timed_out:
+                    lf.write("TIMEOUT after 600s\n")
+                else:
+                    lf.write(f"exit: {returncode}\n")
+
             step_finished = datetime.now(timezone.utc)
 
-            if result.returncode == 0:
+            if timed_out:
+                status = "failed"
+                verdict = "rejected"
+                print("TIMEOUT")
+                print(f"    see: {log_file}")
+            elif returncode == 0:
                 status = "passed"
                 print("ok")
             else:
                 status = "failed"
                 verdict = "rejected"
+
+                # Detect contract violation from the log.
+                if is_gate:
+                    log_text = log_file.read_text()
+                    for marker in ("drift: not found", "driftc: not found",
+                                   "drift: command not found",
+                                   "driftc: command not found",
+                                   "No such file or directory"):
+                        if marker in log_text:
+                            contract_violation = True
+                            break
+                    if contract_violation:
+                        with open(log_file, "a") as lf:
+                            lf.write(
+                                "\n--- contract violation ---\n"
+                                "Gate failed because tooling was not "
+                                "resolved from DRIFT_TOOLCHAIN_ROOT.\n"
+                                "The repo recipe must use "
+                                "$DRIFT_TOOLCHAIN_ROOT/bin/drift and "
+                                "$DRIFT_TOOLCHAIN_ROOT/bin/driftc instead "
+                                "of relying on ambient PATH.\n"
+                            )
+
                 if contract_violation:
                     print("FAILED (contract violation: not using DRIFT_TOOLCHAIN_ROOT)")
                 else:
                     print("FAILED")
                 print(f"    see: {log_file}")
-        except subprocess.TimeoutExpired:
-            step_finished = datetime.now(timezone.utc)
-            status = "failed"
-            verdict = "rejected"
-            log_file.write_text(f"=== {label} ===\nTIMEOUT after 600s\n")
-            print("TIMEOUT")
+
         except FileNotFoundError as e:
             step_finished = datetime.now(timezone.utc)
             status = "blocked"
@@ -1054,10 +1079,22 @@ def execute_run(
                 print(f"  - {err}")
             print()
 
+    # Verify toolchain commit identity if drift-lang was submitted.
+    toolchain_identity = _resolve_toolchain_identity(ctx)
+    toolchain_commit_mismatch: Optional[str] = None
+    if "drift-lang" in plan.candidate_commits:
+        toolchain_commit_mismatch = _verify_toolchain_commit(
+            toolchain_identity, plan.candidate_commits["drift-lang"],
+        )
+        if toolchain_commit_mismatch:
+            print(f"Toolchain identity warning: {toolchain_commit_mismatch}")
+            print()
+
     summary = _build_summary(
         ctx, config, plan, started_at, verdict, step_results,
         toolchain_version=toolchain_version,
         artifacts=artifacts,
+        toolchain_commit_mismatch=toolchain_commit_mismatch,
     )
 
     _write_run_outputs(ctx, summary)
@@ -1113,6 +1150,35 @@ def _resolve_toolchain_identity(ctx: RunContext) -> Optional[dict]:
     return identity
 
 
+_GIT_FIELD_RE = re.compile(r"\bgit ([0-9a-f]{7,40})\b")
+
+
+def _verify_toolchain_commit(
+    identity: Optional[dict], submitted_sha: str,
+) -> Optional[str]:
+    """Check that the staged toolchain's embedded git hash matches the
+    submitted drift-lang commit.
+
+    Returns an error message if there is a mismatch, or None if the
+    identity is unavailable or matches.
+    """
+    if not identity:
+        return None
+    version_str = identity.get("driftc_version", "")
+    m = _GIT_FIELD_RE.search(version_str)
+    if not m:
+        return None
+    embedded = m.group(1)
+    # The embedded hash is typically short (7 chars).  Compare as a prefix.
+    if submitted_sha.startswith(embedded) or embedded.startswith(submitted_sha):
+        return None
+    return (
+        f"toolchain commit mismatch: staged driftc reports git {embedded}, "
+        f"but submitted drift-lang commit is {submitted_sha[:7]}. "
+        f"The built toolchain does not embed the submitted source identity."
+    )
+
+
 def _build_summary(
     ctx: RunContext,
     config: OrchestrationConfig,
@@ -1123,6 +1189,7 @@ def _build_summary(
     block_reason: Optional[str] = None,
     toolchain_version: Optional[str] = None,
     artifacts: Optional[list[dict]] = None,
+    toolchain_commit_mismatch: Optional[str] = None,
 ) -> dict:
     finished_at = datetime.now(timezone.utc)
     summary: dict = {
@@ -1161,6 +1228,8 @@ def _build_summary(
         summary["artifacts"] = artifacts
     if block_reason:
         summary["block_reason"] = block_reason
+    if toolchain_commit_mismatch:
+        summary["toolchain_commit_mismatch"] = toolchain_commit_mismatch
     return summary
 
 
@@ -1192,6 +1261,153 @@ def _update_workspace_lock(
 
 
 # ---------------------------------------------------------------------------
+# Promotion
+# ---------------------------------------------------------------------------
+
+def _load_run_summary(run_root: Path) -> dict:
+    summary_path = run_root / "summary.json"
+    if not summary_path.exists():
+        print(f"error: run summary not found: {summary_path}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(summary_path.read_text())
+
+
+def _safe_unlink(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _check_dest_cleanliness(dest: Path) -> list[str]:
+    """Check the promotion destination for transient/leaked artifacts.
+
+    Returns a list of problem descriptions, empty if clean.
+    """
+    problems: list[str] = []
+    if not dest.exists():
+        return problems
+    for entry in dest.iterdir():
+        if entry.name.startswith(".drift-deploy-staging"):
+            problems.append(
+                f"leaked deploy staging directory: {entry}"
+            )
+    return problems
+
+
+def promote_run(run_id: str, dest_root: Path) -> int:
+    """Promote a certified run into the snapshot-scoped certified tree.
+
+    Layout:
+        <dest_root>/certified/snapshots/<run-id>/toolchain/
+        <dest_root>/certified/snapshots/<run-id>/libs/
+        <dest_root>/certified/snapshots/<run-id>/summary.json
+        <dest_root>/certified/snapshots/<run-id>/report.txt
+        <dest_root>/certified/current -> snapshots/<run-id>
+    """
+    run_root = Path("build/runs") / run_id
+    summary = _load_run_summary(run_root)
+
+    if summary.get("verdict") != "certified":
+        print(
+            f"error: run {run_id} is not certified "
+            f"(verdict={summary.get('verdict', 'unknown')})",
+            file=sys.stderr,
+        )
+        return 1
+
+    staging = summary.get("staging", {})
+    toolchain_root_str = staging.get("toolchain_root", "")
+    libs_root_str = staging.get("libs_root", "")
+    if not toolchain_root_str or not libs_root_str:
+        print(f"error: run {run_id} summary is missing staging roots",
+              file=sys.stderr)
+        return 1
+    source_toolchain_root = Path(toolchain_root_str)
+    source_libs_root = Path(libs_root_str)
+
+    resolved_dest = dest_root.expanduser().resolve()
+
+    # Reject destinations with leaked transient state.
+    dest_problems = _check_dest_cleanliness(resolved_dest)
+    if dest_problems:
+        print("error: destination root contains transient artifacts "
+              "that must be cleaned up before promotion:",
+              file=sys.stderr)
+        for p in dest_problems:
+            print(f"  - {p}", file=sys.stderr)
+        return 1
+
+    # Snapshot destination.
+    snapshots_dir = resolved_dest / "certified" / "snapshots"
+    snapshot_dir = snapshots_dir / run_id
+
+    if snapshot_dir.exists():
+        print(f"error: snapshot already exists: {snapshot_dir}",
+              file=sys.stderr)
+        print("Promotion must not overwrite an existing certified snapshot.",
+              file=sys.stderr)
+        return 1
+
+    snapshot_dir.mkdir(parents=True)
+    snapshot_toolchain = snapshot_dir / "toolchain"
+    snapshot_libs = snapshot_dir / "libs"
+
+    print(f"Promoting certified run: {run_id}")
+    print(f"  source toolchain: {source_toolchain_root}")
+    print(f"  source libs:      {source_libs_root}")
+    print(f"  snapshot:         {snapshot_dir}")
+    print()
+
+    # Copy toolchain: resolve the current symlink and copy the versioned dir,
+    # then recreate the current symlink inside the snapshot.
+    current_link = source_toolchain_root / "current"
+    if not current_link.exists():
+        print(f"error: staged toolchain missing current symlink: {current_link}",
+              file=sys.stderr)
+        shutil.rmtree(snapshot_dir)
+        return 1
+
+    source_versioned_dir = current_link.resolve()
+    versioned_name = source_versioned_dir.name
+    snapshot_toolchain.mkdir()
+    shutil.copytree(
+        source_versioned_dir,
+        snapshot_toolchain / versioned_name,
+        symlinks=True,
+    )
+    (snapshot_toolchain / "current").symlink_to(versioned_name)
+
+    # Copy libs.
+    if not source_libs_root.exists():
+        print(f"error: staged libs root not found: {source_libs_root}",
+              file=sys.stderr)
+        shutil.rmtree(snapshot_dir)
+        return 1
+
+    shutil.copytree(source_libs_root, snapshot_libs, symlinks=True)
+
+    # Copy certification metadata into the snapshot.
+    for name in ("summary.json", "report.txt", "report-short.txt", "artifacts.txt"):
+        src = run_root / name
+        if src.exists():
+            shutil.copy2(src, snapshot_dir / name)
+
+    # Update the certified/current convenience symlink.
+    current_symlink = resolved_dest / "certified" / "current"
+    if current_symlink.exists() or current_symlink.is_symlink():
+        _safe_unlink(current_symlink)
+    current_symlink.symlink_to(Path("snapshots") / run_id)
+
+    print("Promotion complete:")
+    print(f"  snapshot:  {snapshot_dir}")
+    print(f"  toolchain: {snapshot_toolchain / 'current'}")
+    print(f"  libs:      {snapshot_libs}")
+    print(f"  current:   {current_symlink} -> {current_symlink.resolve()}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1218,10 +1434,25 @@ def main() -> None:
         help="Output plan as JSON",
     )
 
-    run_parser = sub.add_parser("run", help="Execute a certification run")
-    run_parser.add_argument(
+    certify_parser = sub.add_parser("certify", help="Execute a certification run")
+    certify_parser.add_argument(
         "input_file",
         help="JSON file mapping repo names to candidate commit SHAs",
+    )
+
+    promote_parser = sub.add_parser(
+        "promote", help="Promote a certified run into a snapshot-scoped certified tree"
+    )
+    promote_parser.add_argument(
+        "run_id",
+        help="Certified run id to promote",
+    )
+    promote_parser.add_argument(
+        "--dest-root",
+        default="~/opt/drift",
+        help="Destination root; snapshot published under "
+             "<dest-root>/certified/snapshots/<run-id>/ "
+             "(default: ~/opt/drift)",
     )
 
     args = parser.parse_args()
@@ -1229,6 +1460,10 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
+    if args.command == "promote":
+        sys.exit(promote_run(args.run_id, Path(args.dest_root)))
+
+    # Commands below here require a valid orchestration config.
     config_path = Path(args.config)
     if not config_path.exists():
         print(f"error: config not found: {config_path}", file=sys.stderr)
@@ -1236,7 +1471,7 @@ def main() -> None:
 
     config = OrchestrationConfig.load(config_path)
 
-    if args.command in ("plan", "run"):
+    if args.command in ("plan", "certify"):
         plan = _load_and_plan(config, args.input_file)
         if plan is None:
             sys.exit(0)
@@ -1254,7 +1489,7 @@ def main() -> None:
 def _load_and_plan(
     config: OrchestrationConfig, input_file: str
 ) -> Optional[ExecutionPlan]:
-    """Shared input validation and plan computation for plan/run commands."""
+    """Shared input validation and plan computation for plan/certify commands."""
     input_path = Path(input_file)
     if not input_path.exists():
         print(f"error: commit input file not found: {input_path}", file=sys.stderr)
