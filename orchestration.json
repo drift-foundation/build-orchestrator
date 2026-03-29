@@ -62,8 +62,8 @@
     "driftc_rel": "bin/driftc",
     "drift_rel": "bin/drift",
     "vars": {
-      "DRIFT_TOOLCHAIN_ROOT": "{toolchain_root}/current",
-      "DRIFTC": "{toolchain_root}/current/bin/driftc",
+      "DRIFT_TOOLCHAIN_ROOT": "{toolchain_root}",
+      "DRIFTC": "{toolchain_root}/bin/driftc",
       "DRIFT_PACKAGE_ROOT": "{libs_root}",
       "DRIFT_PKG_ROOT": "{libs_root}"
     }

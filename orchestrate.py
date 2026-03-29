@@ -637,7 +637,7 @@ def _parse_version_tuple(version_str: str) -> tuple[int, ...]:
 
 def get_toolchain_version(ctx: "RunContext") -> Optional[str]:
     """Get the driftc version string from the staged toolchain."""
-    driftc = ctx.toolchain_root / "current" / "bin" / "driftc"
+    driftc = ctx.toolchain_root / "bin" / "driftc"
     if not driftc.exists():
         return None
     try:
@@ -825,8 +825,8 @@ def resolve_placeholders(
     subs = {
         "{toolchain_root}": str(ctx.toolchain_root.resolve()),
         "{libs_root}": str(ctx.libs_root.resolve()),
-        "{staged_drift}": str((ctx.toolchain_root / "current" / "bin" / "drift").resolve()),
-        "{staged_driftc}": str((ctx.toolchain_root / "current" / "bin" / "driftc").resolve()),
+        "{staged_drift}": str((ctx.toolchain_root / "bin" / "drift").resolve()),
+        "{staged_driftc}": str((ctx.toolchain_root / "bin" / "driftc").resolve()),
     }
     resolved = []
     for arg in argv:
@@ -884,7 +884,7 @@ def build_step_env(
             value = value.replace(placeholder, resolved)
         env[var] = value
 
-    staged_bin = str((ctx.toolchain_root / "current" / "bin").resolve())
+    staged_bin = str((ctx.toolchain_root / "bin").resolve())
 
     if gate:
         # Certification gates: scrub ambient drift/driftc from PATH so
@@ -1150,15 +1150,14 @@ def _write_run_outputs(ctx: RunContext, summary: dict) -> None:
 
 def _resolve_toolchain_identity(ctx: RunContext) -> Optional[dict]:
     """Read the staged toolchain version and paths if available."""
-    current_link = ctx.toolchain_root / "current"
-    if not current_link.exists():
+    # Flat layout: toolchain_root is the toolchain root directly,
+    # with bin/, lib/ etc. underneath.  No inner current symlink
+    # or versioned subdirectory.
+    driftc_bin = ctx.toolchain_root / "bin" / "driftc"
+    drift_bin = ctx.toolchain_root / "bin" / "drift"
+    if not driftc_bin.exists() and not drift_bin.exists():
         return None
-    # The symlink target is the versioned directory name, e.g. "drift-0.27.92+abi6".
-    target = current_link.resolve()
-    drift_bin = target / "bin" / "drift"
-    driftc_bin = target / "bin" / "driftc"
-    identity: dict = {"directory": target.name}
-    # Try to get the version from driftc --version.
+    identity: dict = {"directory": ctx.toolchain_root.name}
     if driftc_bin.exists():
         try:
             result = subprocess.run(
@@ -1239,7 +1238,7 @@ def _build_summary(
         },
         "toolchain_contract": {
             "DRIFT_TOOLCHAIN_ROOT": str(
-                (ctx.toolchain_root / "current").resolve()
+                ctx.toolchain_root.resolve()
             ),
             "ambient_scrubbed": True,
             "enforcement": "certification gates ran with ambient "
@@ -1384,24 +1383,15 @@ def promote_run(run_id: str, dest_root: Path) -> int:
     print(f"  snapshot:         {snapshot_dir}")
     print()
 
-    # Copy toolchain: resolve the current symlink and copy the versioned dir,
-    # then recreate the current symlink inside the snapshot.
-    current_link = source_toolchain_root / "current"
-    if not current_link.exists():
-        print(f"error: staged toolchain missing current symlink: {current_link}",
+    # Copy toolchain: flat layout — toolchain_root is the toolchain root
+    # directly, with bin/, lib/ etc. underneath.
+    if not (source_toolchain_root / "bin").exists():
+        print(f"error: staged toolchain missing bin/: {source_toolchain_root}",
               file=sys.stderr)
         shutil.rmtree(snapshot_dir)
         return 1
 
-    source_versioned_dir = current_link.resolve()
-    versioned_name = source_versioned_dir.name
-    snapshot_toolchain.mkdir()
-    shutil.copytree(
-        source_versioned_dir,
-        snapshot_toolchain / versioned_name,
-        symlinks=True,
-    )
-    (snapshot_toolchain / "current").symlink_to(versioned_name)
+    shutil.copytree(source_toolchain_root, snapshot_toolchain, symlinks=True)
 
     # Copy libs.
     if not source_libs_root.exists():
@@ -1458,7 +1448,7 @@ def promote_run(run_id: str, dest_root: Path) -> int:
 
     print("Promotion complete:")
     print(f"  snapshot:  {snapshot_dir}")
-    print(f"  toolchain: {snapshot_toolchain / 'current'}")
+    print(f"  toolchain: {snapshot_toolchain}")
     print(f"  libs:      {snapshot_libs}")
     print(f"  current:   {current_symlink} -> {current_symlink.resolve()}")
     return 0
