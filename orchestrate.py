@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -977,19 +978,32 @@ def execute_run(
                     resolved_cmd, cwd=cwd, env=step_env,
                     stdout=lf, stderr=subprocess.STDOUT,
                 )
-                try:
-                    proc.wait(timeout=600)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    proc.kill()
-                    proc.wait()
+                # Activity-based timeout: kill only after 120s of no
+                # new output.  This lets long-running but progressing
+                # test suites (e.g. plain + ASAN passes) finish while
+                # still catching true hangs quickly.
+                _inactivity_limit = 120
+                lf.flush()
+                _last_size = os.path.getsize(log_file)
+                _last_activity = time.monotonic()
+                while proc.poll() is None:
+                    time.sleep(1)
+                    _cur_size = os.path.getsize(log_file)
+                    if _cur_size != _last_size:
+                        _last_size = _cur_size
+                        _last_activity = time.monotonic()
+                    if time.monotonic() - _last_activity > _inactivity_limit:
+                        timed_out = True
+                        proc.kill()
+                        proc.wait()
+                        break
 
                 returncode = proc.returncode
 
                 # Append trailer.
                 lf.write(f"\n--- end ---\n")
                 if timed_out:
-                    lf.write("TIMEOUT after 600s\n")
+                    lf.write(f"TIMEOUT: no output for {_inactivity_limit}s\n")
                 else:
                     lf.write(f"exit: {returncode}\n")
 
