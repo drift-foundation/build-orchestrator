@@ -327,14 +327,20 @@ def compute_plan(
         if repo_name in validated:
             validation_reason = ("directly changed" if repo_name in changed
                                  else f"depends on {_dep_reason(repo, changed)}")
-            for gate in ("test", "stress", "perf"):
-                if gate in repo.commands:
-                    steps.append({
-                        "repo": repo_name,
-                        "action": gate,
-                        "command": repo.commands[gate],
-                        "reason": validation_reason,
-                    })
+            # Fork every gate into one step per certification lane. Both
+            # lanes run against the same staged toolchain and the same
+            # staged package set; only the gate-execution env differs
+            # (DRIFT_DEBUG selects the runtime at link time).
+            for lane in _LANES:
+                for gate in ("test", "stress", "perf"):
+                    if gate in repo.commands:
+                        steps.append({
+                            "repo": repo_name,
+                            "action": gate,
+                            "lane": lane,
+                            "command": repo.commands[gate],
+                            "reason": validation_reason,
+                        })
 
     return ExecutionPlan(
         candidate_commits=commits,
@@ -392,7 +398,9 @@ def print_plan(plan: ExecutionPlan, config: OrchestrationConfig) -> None:
     print(f"Steps ({len(plan.steps)}):")
     for i, step in enumerate(plan.steps, 1):
         cmd_str = " ".join(shlex.quote(a) for a in step["command"])
-        print(f"  {i}. [{step['repo']}] {step['action']}")
+        lane = step.get("lane")
+        lane_suffix = f" ({lane})" if lane else ""
+        print(f"  {i}. [{step['repo']}] {step['action']}{lane_suffix}")
         print(f"     command: {cmd_str}")
         print(f"     reason:  {step['reason']}")
     print()
@@ -418,32 +426,43 @@ def _short_sha(sha: str) -> str:
     return sha[:7] if len(sha) >= 7 else sha
 
 
-def _repo_results(summary: dict) -> dict[str, str]:
-    """Derive per-repo validation status from step results.
+def _repo_results(summary: dict) -> dict[tuple[str, str], str]:
+    """Derive per-(repo, lane) validation status from step results.
 
-    Returns a map of repo -> "PASS" | "FAIL" | "BLOCKED" | "NOT RUN"
-    for each validated repo.
+    Returns a map of ``(repo, lane) -> "PASS" | "FAIL" | "BLOCKED" |
+    "NOT RUN"`` for every (validated_repo × lane) pair. Lanes are the
+    fixed pair ``("normal", "debug")`` — both must be present in the
+    result so reporting and verdict aggregation can see when a lane
+    never ran.
+
+    Tolerates legacy step records that lack a ``lane`` key (treats
+    them as ``"normal"``) so historical summary replays still work.
     """
     validated = set(summary.get("validated_repos", []))
-    # Collect the worst status per repo from executed steps, ignoring
-    # bootstrap/stage_toolchain (those are infra, not validation).
-    repo_status: dict[str, str] = {}
+    repo_status: dict[tuple[str, str], str] = {}
     for step in summary.get("steps", []):
         repo = step["repo"]
         if repo not in validated:
             continue
+        # Only certification gates contribute to lane verdicts; infra
+        # steps (bootstrap, stage_*) are not validation.
+        if step.get("name") not in _CERTIFICATION_GATES:
+            continue
+        lane = step.get("lane") or "normal"
+        key = (repo, lane)
         status = step["status"]
         if status == "passed":
-            repo_status.setdefault(repo, "PASS")
+            repo_status.setdefault(key, "PASS")
         elif status == "failed":
-            repo_status[repo] = "FAIL"
+            repo_status[key] = "FAIL"
         elif status == "blocked":
-            repo_status[repo] = "BLOCKED"
+            repo_status[key] = "BLOCKED"
 
-    # Repos in validated_repos that never had a step executed are NOT RUN.
+    # Seed NOT RUN for every (validated_repo, lane) pair that never
+    # produced a gate step (e.g. fail-fast short-circuited the run).
     for repo in summary.get("validated_repos", []):
-        if repo not in repo_status:
-            repo_status[repo] = "NOT RUN"
+        for lane in _LANES:
+            repo_status.setdefault((repo, lane), "NOT RUN")
 
     return repo_status
 
@@ -521,7 +540,9 @@ def generate_report(summary: dict) -> str:
     lines.append("")
     lines.append("Result by repo:")
     for r in validated:
-        lines.append(f"  - {r}: {repo_results.get(r, 'NOT RUN')}")
+        for lane in _LANES:
+            status = repo_results.get((r, lane), "NOT RUN")
+            lines.append(f"  - {r} ({lane}): {status}")
 
     if verdict in ("REJECTED", "BLOCKED"):
         fail_step = _first_failure(summary)
@@ -529,7 +550,9 @@ def generate_report(summary: dict) -> str:
         lines.append("")
         lines.append("Failure summary:")
         if fail_step:
-            lines.append(f"  - {fail_step['repo']}")
+            fail_lane = fail_step.get("lane")
+            lane_label = f" [{fail_lane}]" if fail_lane else ""
+            lines.append(f"  - {fail_step['repo']}{lane_label}")
             lines.append(f"    step: {fail_step['name']}")
             lines.append(f"    reason: {reason}")
         elif summary.get("block_reason"):
@@ -604,8 +627,11 @@ def generate_report_short(summary: dict) -> str:
         fail_step = _first_failure(summary)
         if fail_step:
             reason = _failure_reason(summary)
+            fail_lane = fail_step.get("lane")
+            lane_label = f" [{fail_lane}]" if fail_lane else ""
             return (f"{verdict}: submitted {submitted_label}. "
-                    f"First failure: {fail_step['repo']} {fail_step['name']} "
+                    f"First failure: {fail_step['repo']} "
+                    f"{fail_step['name']}{lane_label} "
                     f"({reason}). {lock_msg}.")
         elif summary.get("block_reason"):
             return (f"{verdict}: submitted {submitted_label}. "
@@ -839,6 +865,64 @@ def resolve_placeholders(
 
 _CERTIFICATION_GATES = frozenset(("test", "stress", "perf"))
 
+# Certification lanes. Both lanes run against the same staged toolchain
+# and the same staged package set. The debug lane is selected at link time
+# inside the consumer build by setting DRIFT_DEBUG=1; the normal lane runs
+# with DRIFT_DEBUG explicitly unset. Selection is purely a runtime-link
+# concern — there is no per-lane staging.
+_LANES: tuple[str, ...] = ("normal", "debug")
+_DUAL_RUNTIME_BLOCK_REASON = (
+    "staged toolchain does not declare dual-runtime support"
+)
+
+
+def _verify_dual_runtime_support(ctx: "RunContext") -> Optional[str]:
+    """Verify the staged toolchain manifest declares both runtime variants.
+
+    Reads ``lib/manifest.json`` from the staged toolchain root and checks
+    that ``runtimes.normal.lib`` and ``runtimes.debug.lib`` are both
+    present and that the referenced files exist on disk under the staged
+    toolchain root. Returns ``None`` on success, or a human-readable
+    error message describing the first failed check.
+    """
+    manifest_path = ctx.toolchain_root / "lib" / "manifest.json"
+    if not manifest_path.exists():
+        return f"missing toolchain manifest: {manifest_path}"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError as e:
+        return f"toolchain manifest is not valid JSON ({manifest_path}): {e}"
+
+    runtimes = manifest.get("runtimes")
+    if not isinstance(runtimes, dict):
+        return (
+            f"toolchain manifest missing 'runtimes' map ({manifest_path}); "
+            f"a dual-runtime-aware drift-lang build is required"
+        )
+
+    for lane in _LANES:
+        entry = runtimes.get(lane)
+        if not isinstance(entry, dict):
+            return (
+                f"toolchain manifest missing 'runtimes.{lane}' entry "
+                f"({manifest_path})"
+            )
+        rel = entry.get("lib")
+        if not isinstance(rel, str) or not rel:
+            return (
+                f"toolchain manifest 'runtimes.{lane}.lib' is missing or "
+                f"not a string ({manifest_path})"
+            )
+        # Resolve relative to the staged toolchain root.
+        lib_path = (ctx.toolchain_root / rel).resolve()
+        if not lib_path.is_file():
+            return (
+                f"toolchain manifest declares 'runtimes.{lane}.lib' = {rel} "
+                f"but file does not exist on disk under staged toolchain "
+                f"({lib_path})"
+            )
+    return None
+
 
 def _scrub_ambient_toolchain(path_value: str, staged_bin: str) -> str:
     """Remove PATH entries that contain ambient drift/driftc binaries.
@@ -862,7 +946,11 @@ def _scrub_ambient_toolchain(path_value: str, staged_bin: str) -> str:
 
 
 def build_step_env(
-    config: OrchestrationConfig, ctx: RunContext, *, gate: bool = False,
+    config: OrchestrationConfig,
+    ctx: RunContext,
+    *,
+    gate: bool = False,
+    lane: Optional[str] = None,
 ) -> dict[str, str]:
     """Build environment variables for step execution.
 
@@ -870,8 +958,28 @@ def build_step_env(
     ambient PATH entries that contain ``drift`` or ``driftc`` are removed
     so that downstream recipes can only succeed if they resolve tooling
     from ``DRIFT_TOOLCHAIN_ROOT``.
+
+    The *lane* selects the runtime certification lane for gate steps.
+    Only ``"debug"`` injects ``DRIFT_DEBUG=1``; the ``"normal"`` lane
+    runs with ``DRIFT_DEBUG`` explicitly unset. ``DRIFT_DEBUG`` is
+    always scrubbed from the inherited environment first so the
+    operator's shell state cannot leak into a run.
+
+    Note: ``DRIFT_COMPILER_DEBUG`` is the compiler-internal structured
+    debug flag and is intentionally left untouched — orchestration only
+    owns the runtime-lane selector.
     """
     env = dict(os.environ)
+    # Hermetic lane selection: scrub any inherited DRIFT_DEBUG (and the
+    # retired DRIFT_OPTIMIZED) before re-adding only what this lane wants.
+    env.pop("DRIFT_DEBUG", None)
+    env.pop("DRIFT_OPTIMIZED", None)
+    if gate and lane == "debug":
+        env["DRIFT_DEBUG"] = "1"
+    # Honor DRIFT_TEST_JOBS if the operator set it; otherwise default to
+    # nproc/2 (matching the compiler build's policy). Floor at 1.
+    if "DRIFT_TEST_JOBS" not in env:
+        env["DRIFT_TEST_JOBS"] = str(max(1, (os.cpu_count() or 2) // 2))
     toolchain_root = str(ctx.toolchain_root.resolve())
     libs_root = str(ctx.libs_root.resolve())
 
@@ -936,24 +1044,51 @@ def execute_run(
     print()
 
     # Execute steps.
-    infra_env = build_step_env(config, ctx, gate=False)
-    gate_env = build_step_env(config, ctx, gate=True)
     step_results: list[dict] = []
     verdict = "certified"
+    dual_runtime_verified = False
 
     for step in plan.steps:
         repo_name = step["repo"]
         action = step["action"]
+        lane = step.get("lane")
         raw_cmd = step["command"]
         resolved_cmd = resolve_placeholders(raw_cmd, ctx)
         cwd = checkout_dirs[repo_name]
-        log_file = ctx.logs_root / f"{repo_name}.{action}.log"
         is_gate = action in _CERTIFICATION_GATES
+        # Lane-aware log filename so the two lanes' gate logs don't
+        # overwrite each other. Infra steps keep the historical name.
+        if lane:
+            log_file = ctx.logs_root / f"{repo_name}.{action}.{lane}.log"
+        else:
+            log_file = ctx.logs_root / f"{repo_name}.{action}.log"
 
-        label = f"[{repo_name}] {action}"
+        label = (f"[{repo_name}] {action} ({lane})" if lane
+                 else f"[{repo_name}] {action}")
         print(f"  {label} ...", end=" ", flush=True)
 
-        step_env = gate_env if is_gate else infra_env
+        # Pre-gate dual-runtime capability check. Runs once, the first
+        # time we are about to execute a certification gate. By that
+        # point stage_toolchain has already succeeded (otherwise we'd
+        # never reach a gate), so the manifest must be present.
+        if is_gate and not dual_runtime_verified:
+            err = _verify_dual_runtime_support(ctx)
+            dual_runtime_verified = True
+            if err:
+                print("BLOCKED (dual-runtime check)")
+                print(f"    {err}")
+                verdict = "blocked"
+                summary = _build_summary(
+                    ctx, config, plan, started_at, "blocked",
+                    steps_results=step_results,
+                    block_reason=f"{_DUAL_RUNTIME_BLOCK_REASON}: {err}",
+                )
+                _write_run_outputs(ctx, summary)
+                return summary
+
+        step_env = build_step_env(
+            config, ctx, gate=is_gate, lane=lane,
+        )
         step_started = datetime.now(timezone.utc)
         contract_violation = False
         returncode: Optional[int] = None
@@ -967,6 +1102,8 @@ def execute_run(
                     f"command: {resolved_cmd}\n"
                     f"cwd: {cwd}\n"
                     f"certification_gate: {is_gate}\n"
+                    f"lane: {lane or '-'}\n"
+                    f"DRIFT_DEBUG: {step_env.get('DRIFT_DEBUG', '')}\n"
                     f"DRIFT_TOOLCHAIN_ROOT: "
                     f"{step_env.get('DRIFT_TOOLCHAIN_ROOT', 'NOT SET')}\n"
                     f"\n"
@@ -1059,6 +1196,7 @@ def execute_run(
         step_record: dict = {
             "repo": repo_name,
             "name": action,
+            "lane": lane,
             "status": status,
             "command": resolved_cmd,
             "log_path": str(log_file),
@@ -1069,6 +1207,7 @@ def execute_run(
             step_record["certification_gate"] = True
             step_record["DRIFT_TOOLCHAIN_ROOT"] = step_env.get(
                 "DRIFT_TOOLCHAIN_ROOT", None)
+            step_record["DRIFT_DEBUG"] = step_env.get("DRIFT_DEBUG", "")
             if contract_violation:
                 step_record["contract_violation"] = True
         step_results.append(step_record)
