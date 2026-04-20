@@ -65,7 +65,8 @@
       "DRIFT_TOOLCHAIN_ROOT": "{toolchain_root}",
       "DRIFTC": "{toolchain_root}/bin/driftc",
       "DRIFT_PACKAGE_ROOT": "{libs_root}",
-      "DRIFT_PKG_ROOT": "{libs_root}"
+      "DRIFT_PKG_ROOT": "{libs_root}",
+      "DRIFT_SOURCE_REBUILD": "1"
     }
   }
 }

@@ -1047,6 +1047,7 @@ def execute_run(
     step_results: list[dict] = []
     verdict = "certified"
     dual_runtime_verified = False
+    seen_artifacts: set[tuple[str, str]] = set()
 
     for step in plan.steps:
         repo_name = step["repo"]
@@ -1154,6 +1155,24 @@ def execute_run(
             elif returncode == 0:
                 status = "passed"
                 print("ok")
+                if action == "stage_toolchain":
+                    tc_ver = get_toolchain_version(ctx)
+                    if tc_ver:
+                        print(f"    staged toolchain: {tc_ver}")
+                elif action == "stage_packages":
+                    current = scan_staged_artifacts(ctx.libs_root)
+                    new_rows = [
+                        (a["name"], a["version"]) for a in current
+                        if (a["name"], a["version"]) not in seen_artifacts
+                    ]
+                    if new_rows:
+                        listing = ", ".join(
+                            f"{n}@{v}" for n, v in sorted(new_rows)
+                        )
+                        print(f"    staged: {listing}")
+                    seen_artifacts.update(
+                        (a["name"], a["version"]) for a in current
+                    )
             else:
                 status = "failed"
                 verdict = "rejected"

@@ -1,27 +1,30 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-04-11T03:51:09.502783+00:00",
-  "source_run_id": "20260411-032859-drift-web-96988f6",
+  "updated_at": "2026-04-19T05:15:59.502446+00:00",
+  "source_run_id": "20260419-043053-drift-lang-7dffff3",
   "verdict": "certified",
   "changed_repos": [
+    "drift-lang",
+    "drift-mariadb-client",
+    "drift-net-tls",
     "drift-web"
   ],
   "repos": {
     "drift-lang": {
       "path": "../drift-lang",
-      "commit": "37356c5e2cebc2c0c534a375658b94a8a678b4cf"
+      "commit": "7dffff31b4ede5fd3d2ad07e99ecb2954ed25e49"
     },
     "drift-mariadb-client": {
       "path": "../drift-mariadb-client",
-      "commit": "7b18b80181457edcb0f9be86b60e6738a2ee5e98"
+      "commit": "73ae63a446a7bd3c65890d9e7e8edbf90ac9da46"
     },
     "drift-net-tls": {
       "path": "../drift-net-tls",
-      "commit": "d5ffa338e177c685ebde553dea16a9b346f96c3b"
+      "commit": "c66192a176108626a60546c8dbb517f340e7defb"
     },
     "drift-web": {
       "path": "../drift-web",
-      "commit": "96988f61c36bffa541814aaf7c7f86bbdd6b5631"
+      "commit": "efa8be882d5b87ba97de9ef42f7105ca72053dba"
     }
   }
 }
