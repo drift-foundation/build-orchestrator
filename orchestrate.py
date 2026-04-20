@@ -1116,10 +1116,13 @@ def execute_run(
                     resolved_cmd, cwd=cwd, env=step_env,
                     stdout=lf, stderr=subprocess.STDOUT,
                 )
-                # Activity-based timeout: kill only after 120s of no
-                # new output.  This lets long-running but progressing
-                # test suites (e.g. plain + ASAN passes) finish while
-                # still catching true hangs quickly.
+                # Activity-based timeout: kill after 120s of no new
+                # output. Gate recipes are contractually required to
+                # emit progress on stdout/stderr (at least every ~60s)
+                # so this watchdog catches true hangs quickly. If a
+                # recipe redirects test output to side logs without a
+                # stream copy, it violates the contract and will trip
+                # this watchdog — fix the recipe, not the limit.
                 _inactivity_limit = 120
                 lf.flush()
                 _last_size = os.path.getsize(log_file)
