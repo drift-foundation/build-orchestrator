@@ -2,6 +2,7 @@
 """Workspace certification orchestrator for the drift ecosystem."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,25 @@ from typing import Optional
 
 
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+# Run-snapshot format constants. Mirror the drift-lang toolchain
+# contract at tools/drift_deploy/run_snapshot.py. Bump together when
+# the toolchain lands a v1 format.
+_RUN_SNAPSHOT_FORMAT = "drift-run-snapshot"
+_RUN_SNAPSHOT_VERSION = 0
+
+# Sidecar format constants (mirrored from drift-lang).
+_SOURCE_ATTESTATION_FORMAT = "drift-source-attestation"
+_SOURCE_ATTESTATION_VERSION = 0
+_SOURCE_ATTESTATION_BODY_SCHEMA_VERSION = 1
+_PKG_SIG_FORMAT = "dmir-pkg-sig"
+_PKG_SIG_VERSION = 0
+
+# Strict validators for run-snapshot field shapes. The toolchain's
+# loader is strict; orch enforces the same shapes at emit time so
+# violations surface at snapshot build, not at gate consume.
+_SHA256_HEX_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ED25519_KID_RE = re.compile(r"^ed25519:.+$")
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +758,279 @@ def scan_staged_artifacts(libs_root: Path) -> list[dict]:
     return results
 
 
+class RunSnapshotError(RuntimeError):
+    """Raised when the run snapshot cannot be built: missing or malformed
+    sidecar, out-of-shape field, or disagreeing duplicate entry. Aborts
+    the certification run before any gate step runs — the toolchain's
+    snapshot loader is strict, so partial or malformed snapshots would
+    fail opaquely at gate time."""
+
+
+def _validate_sha256_hex_id(value, *, where: str) -> str:
+    if not isinstance(value, str) or not _SHA256_HEX_ID_RE.match(value):
+        raise RunSnapshotError(
+            f"{where}: 'source_content_id' {value!r} is not strict "
+            f"'sha256:<64-lowercase-hex>' form"
+        )
+    return value
+
+
+def _validate_ed25519_kid(value, *, where: str) -> str:
+    if not isinstance(value, str) or not _ED25519_KID_RE.match(value):
+        raise RunSnapshotError(
+            f"{where}: signer kid {value!r} is not 'ed25519:<kid>' form"
+        )
+    return value
+
+
+def _read_sidecar_json(path: Path, *, where: str) -> dict:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise RunSnapshotError(f"{where}: required sidecar missing: {path}")
+    except OSError as e:
+        raise RunSnapshotError(f"{where}: cannot read sidecar {path}: {e}")
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RunSnapshotError(
+            f"{where}: sidecar is not valid JSON ({path}): {e}"
+        )
+    if not isinstance(obj, dict):
+        raise RunSnapshotError(
+            f"{where}: top-level value in {path} must be a JSON object"
+        )
+    return obj
+
+
+def _extract_attestation_fields(
+    attest_path: Path, zdmp: Path,
+) -> tuple[str, str, str, str]:
+    """Parse a `.source-attestation` sidecar. Returns
+    (package_id, version, source_content_id, source_attestation_key).
+    Strict on every field; raises RunSnapshotError on any violation."""
+    where = f"source-attestation for {zdmp.name}"
+    obj = _read_sidecar_json(attest_path, where=where)
+    fmt = obj.get("format")
+    if fmt != _SOURCE_ATTESTATION_FORMAT:
+        raise RunSnapshotError(
+            f"{where} ({attest_path}): expected format "
+            f"{_SOURCE_ATTESTATION_FORMAT!r}, got {fmt!r}"
+        )
+    ver = obj.get("version")
+    if ver != _SOURCE_ATTESTATION_VERSION:
+        raise RunSnapshotError(
+            f"{where} ({attest_path}): expected version "
+            f"{_SOURCE_ATTESTATION_VERSION}, got {ver!r}"
+        )
+    body = obj.get("body")
+    if not isinstance(body, dict):
+        raise RunSnapshotError(
+            f"{where} ({attest_path}): 'body' must be a JSON object"
+        )
+    body_sv = body.get("schema_version")
+    if body_sv != _SOURCE_ATTESTATION_BODY_SCHEMA_VERSION:
+        raise RunSnapshotError(
+            f"{where} ({attest_path}): body.schema_version {body_sv!r} != "
+            f"{_SOURCE_ATTESTATION_BODY_SCHEMA_VERSION}"
+        )
+    pkg_id = body.get("package_id")
+    version = body.get("version")
+    if not isinstance(pkg_id, str) or not pkg_id:
+        raise RunSnapshotError(
+            f"{where} ({attest_path}): missing or empty body.package_id"
+        )
+    if not isinstance(version, str) or not version:
+        raise RunSnapshotError(
+            f"{where} ({attest_path}): missing or empty body.version"
+        )
+    scid = _validate_sha256_hex_id(
+        body.get("source_content_id"),
+        where=f"{where} ({attest_path}) body",
+    )
+    sigs = obj.get("signatures")
+    if not isinstance(sigs, list) or not sigs:
+        raise RunSnapshotError(
+            f"{where} ({attest_path}): 'signatures' must be a non-empty list"
+        )
+    first = sigs[0]
+    if not isinstance(first, dict):
+        raise RunSnapshotError(
+            f"{where} ({attest_path}): signatures[0] must be a JSON object"
+        )
+    attest_kid = _validate_ed25519_kid(
+        first.get("kid"),
+        where=f"{where} ({attest_path}) signatures[0].kid",
+    )
+    return pkg_id, version, scid, attest_kid
+
+
+def _extract_sig_author_kid(sig_path: Path, zdmp: Path) -> str:
+    """Parse a `.sig` sidecar. Returns the first signer's kid (author_key).
+    Strict; raises RunSnapshotError on any violation."""
+    where = f"sig sidecar for {zdmp.name}"
+    obj = _read_sidecar_json(sig_path, where=where)
+    fmt = obj.get("format")
+    if fmt != _PKG_SIG_FORMAT:
+        raise RunSnapshotError(
+            f"{where} ({sig_path}): expected format {_PKG_SIG_FORMAT!r}, "
+            f"got {fmt!r}"
+        )
+    ver = obj.get("version")
+    if ver != _PKG_SIG_VERSION:
+        raise RunSnapshotError(
+            f"{where} ({sig_path}): expected version {_PKG_SIG_VERSION}, "
+            f"got {ver!r}"
+        )
+    sigs = obj.get("signatures")
+    if not isinstance(sigs, list) or not sigs:
+        raise RunSnapshotError(
+            f"{where} ({sig_path}): 'signatures' must be a non-empty list"
+        )
+    first = sigs[0]
+    if not isinstance(first, dict):
+        raise RunSnapshotError(
+            f"{where} ({sig_path}): signatures[0] must be a JSON object"
+        )
+    return _validate_ed25519_kid(
+        first.get("kid"),
+        where=f"{where} ({sig_path}) signatures[0].kid",
+    )
+
+
+def _write_snapshot_atomic(snapshot: dict, out_path: Path) -> None:
+    """Serialize a run snapshot dict to disk via tmp + rename. Used by
+    both the empty-seed write and the post-stage refresh so any
+    concurrent reader (a gate starting as orch writes) only ever
+    observes a complete JSON file."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, out_path)
+
+
+def write_empty_run_snapshot(run_id: str, out_path: Path) -> dict:
+    """Seed a format-valid but empty run snapshot at out_path. The
+    0.31.6+ toolchain requires DRIFT_RUN_SNAPSHOT to point at a valid
+    snapshot file for both stage and certify modes, so the first
+    stage_packages step needs a file to reference. Subsequent
+    stage_packages refreshes rebuild from the full libs tree."""
+    snapshot = {
+        "format": _RUN_SNAPSHOT_FORMAT,
+        "version": _RUN_SNAPSHOT_VERSION,
+        "run_id": run_id,
+        "packages": {},
+    }
+    _write_snapshot_atomic(snapshot, out_path)
+    return snapshot
+
+
+def build_run_snapshot(
+    libs_root: Path, run_id: str, out_path: Path,
+) -> dict:
+    """Walk the staged libs root, read each package's
+    `.source-attestation` + `.sig` sidecars, and emit a v0 run snapshot
+    at `out_path`. Strict on every field; raises RunSnapshotError on
+    any violation. Builds the full entry dict in memory before writing
+    so partial snapshots never hit disk.
+
+    Write is atomic: final path is rename-swapped from a sibling tmp
+    file. A gate step starting concurrently could otherwise observe
+    truncated JSON and fail with an opaque parse error.
+
+    Asserts the attestation body's `package_id` / `version` match the
+    on-disk directory layout; mismatches are a hard failure so the
+    resolver and snapshot cannot disagree on what a key refers to.
+    """
+    if not libs_root.exists():
+        raise RunSnapshotError(f"staged libs_root missing: {libs_root}")
+
+    entries: dict[tuple[str, str], dict] = {}
+
+    for artifact_dir in sorted(libs_root.iterdir()):
+        if not artifact_dir.is_dir():
+            continue
+        for version_dir in sorted(artifact_dir.iterdir()):
+            if not version_dir.is_dir():
+                continue
+            zdmps = sorted(version_dir.glob("*.zdmp"))
+            if not zdmps:
+                # Not a package directory (e.g. an empty shell). The
+                # toolchain's scan contract means absence of .zdmp = no
+                # package to pin.
+                continue
+            for zdmp in zdmps:
+                base = zdmp.stem
+                attest_path = version_dir / f"{base}.source-attestation"
+                sig_path = version_dir / f"{base}.sig"
+                if not attest_path.exists():
+                    raise RunSnapshotError(
+                        f"staged package {zdmp} is missing required "
+                        f"sidecar: {attest_path}"
+                    )
+                if not sig_path.exists():
+                    raise RunSnapshotError(
+                        f"staged package {zdmp} is missing required "
+                        f"sidecar: {sig_path}"
+                    )
+                pkg_id, version, scid, attest_kid = (
+                    _extract_attestation_fields(attest_path, zdmp)
+                )
+                # Asserted invariant: the attestation's declared
+                # identity matches the directory layout the resolver
+                # walks. Divergence means the snapshot key would
+                # disagree with how the resolver addresses the
+                # package — fail here, not at consume time.
+                if pkg_id != artifact_dir.name:
+                    raise RunSnapshotError(
+                        f"attestation body.package_id {pkg_id!r} for "
+                        f"{zdmp} does not match on-disk directory name "
+                        f"{artifact_dir.name!r}"
+                    )
+                if version != version_dir.name:
+                    raise RunSnapshotError(
+                        f"attestation body.version {version!r} for "
+                        f"{zdmp} does not match on-disk directory name "
+                        f"{version_dir.name!r}"
+                    )
+                author_kid = _extract_sig_author_kid(sig_path, zdmp)
+                zdmp_sha = hashlib.sha256(zdmp.read_bytes()).hexdigest()
+                key = (pkg_id, version)
+                new_entry = {
+                    "source_content_id": scid,
+                    "author_key": author_kid,
+                    "source_attestation_key": attest_kid,
+                    "sha256": zdmp_sha,
+                }
+                if key in entries:
+                    if entries[key] != new_entry:
+                        raise RunSnapshotError(
+                            f"conflicting run-snapshot entries for "
+                            f"{pkg_id}@{version}: same (pkg_id, version) "
+                            f"seen twice with different metadata:\n"
+                            f"  first: {entries[key]}\n"
+                            f"  again: {new_entry}"
+                        )
+                    # Duplicate but byte-identical — accept silently.
+                    continue
+                entries[key] = new_entry
+
+    snapshot = {
+        "format": _RUN_SNAPSHOT_FORMAT,
+        "version": _RUN_SNAPSHOT_VERSION,
+        "run_id": run_id,
+        "packages": {
+            f"{pkg_id}|{version}": entry
+            for (pkg_id, version), entry in sorted(entries.items())
+        },
+    }
+    _write_snapshot_atomic(snapshot, out_path)
+    return snapshot
+
+
 def _read_provenance_bundle(path: Path) -> Optional[dict]:
     """Read and parse a .provenance.zst file, extracting key fields."""
     try:
@@ -951,6 +1244,7 @@ def build_step_env(
     *,
     gate: bool = False,
     lane: Optional[str] = None,
+    action: str = "",
 ) -> dict[str, str]:
     """Build environment variables for step execution.
 
@@ -992,6 +1286,35 @@ def build_step_env(
         for placeholder, resolved in subs.items():
             value = value.replace(placeholder, resolved)
         env[var] = value
+
+    # Certification-phase selector. stage_packages = producer role
+    # (DRIFT_CERT_MODE=stage). Certification gates = consumer role
+    # (DRIFT_CERT_MODE=certify + DRIFT_RUN_SNAPSHOT=<path>). All
+    # other steps (bootstrap, stage_toolchain) leave the env unset —
+    # drift-lang's own build machinery is not a certification surface.
+    # The retired DRIFT_SOURCE_REBUILD is hard-rejected by 0.31.5+; we
+    # explicitly scrub any inherited value so an operator's shell can't
+    # bleed it into the run.
+    env.pop("DRIFT_SOURCE_REBUILD", None)
+    env.pop("DRIFT_CERT_MODE", None)
+    env.pop("DRIFT_RUN_SNAPSHOT", None)
+    # Both stage and certify modes consume upstream packages under
+    # certification semantics (source-identity pinned by the run
+    # snapshot), so both require DRIFT_RUN_SNAPSHOT. The modes differ
+    # only on outputs: stage exempts the package currently being
+    # produced from snapshot entry requirements; certify does not.
+    # Orch seeds an empty-but-valid snapshot at run start so the first
+    # stage_packages has a file to reference.
+    if gate:
+        env["DRIFT_CERT_MODE"] = "certify"
+        env["DRIFT_RUN_SNAPSHOT"] = str(
+            (ctx.run_root / "run-snapshot.json").resolve()
+        )
+    elif action == "stage_packages":
+        env["DRIFT_CERT_MODE"] = "stage"
+        env["DRIFT_RUN_SNAPSHOT"] = str(
+            (ctx.run_root / "run-snapshot.json").resolve()
+        )
 
     staged_bin = str((ctx.toolchain_root / "bin").resolve())
 
@@ -1043,6 +1366,15 @@ def execute_run(
             return summary
     print()
 
+    # Seed an empty run snapshot before any step runs. Both stage and
+    # certify modes require DRIFT_RUN_SNAPSHOT to reference a valid
+    # file; the first stage_packages has no prior staged inputs, so an
+    # empty-but-format-valid snapshot is the correct starting state.
+    # Each successful stage_packages refreshes the file from the full
+    # libs tree so later stage steps can verify their upstream inputs.
+    snapshot_path = ctx.run_root / "run-snapshot.json"
+    write_empty_run_snapshot(ctx.run_id, snapshot_path)
+
     # Execute steps.
     step_results: list[dict] = []
     verdict = "certified"
@@ -1088,7 +1420,7 @@ def execute_run(
                 return summary
 
         step_env = build_step_env(
-            config, ctx, gate=is_gate, lane=lane,
+            config, ctx, gate=is_gate, lane=lane, action=action,
         )
         step_started = datetime.now(timezone.utc)
         contract_violation = False
@@ -1175,6 +1507,51 @@ def execute_run(
                         print(f"    staged: {listing}")
                     seen_artifacts.update(
                         (a["name"], a["version"]) for a in current
+                    )
+                    # Refresh the run snapshot from the full libs tree
+                    # after every successful stage_packages. The run
+                    # interleaves stage/gate per repo (stage net-tls,
+                    # gate net-tls, stage mariadb, gate mariadb, ...),
+                    # so a snapshot written once before the first gate
+                    # would miss every repo staged afterward. Scanning
+                    # the full tree each time keeps the snapshot
+                    # cumulative; duplicate agreeing entries are
+                    # accepted silently, conflicting entries are a
+                    # hard failure. The next stage step also reads
+                    # this file (stage mode consumes upstreams under
+                    # certification semantics), so a failed refresh
+                    # blocks the whole run.
+                    try:
+                        snapshot = build_run_snapshot(
+                            ctx.libs_root, ctx.run_id, snapshot_path,
+                        )
+                    except RunSnapshotError as e:
+                        print(f"    snapshot refresh FAILED: {e}",
+                              file=sys.stderr)
+                        status = "blocked"
+                        verdict = "blocked"
+                        step_record = {
+                            "repo": repo_name,
+                            "name": action,
+                            "lane": lane,
+                            "status": status,
+                            "command": resolved_cmd,
+                            "log_path": str(log_file),
+                            "started_at": step_started.isoformat(),
+                            "finished_at": datetime.now(
+                                timezone.utc).isoformat(),
+                        }
+                        step_results.append(step_record)
+                        summary = _build_summary(
+                            ctx, config, plan, started_at, "blocked",
+                            steps_results=step_results,
+                            block_reason=f"run-snapshot refresh failed: {e}",
+                        )
+                        _write_run_outputs(ctx, summary)
+                        return summary
+                    print(
+                        f"    snapshot: "
+                        f"{len(snapshot['packages'])} packages pinned"
                     )
             else:
                 status = "failed"
