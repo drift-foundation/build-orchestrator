@@ -126,6 +126,7 @@ class ExecutionPlan:
     involved_repos: list[str]
     validated_repos: list[str]
     steps: list[dict] = field(default_factory=list)
+    fasttrack: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +292,7 @@ def compute_plan(
     commits: dict[str, str],
     sources: dict[str, str],
     changed: list[str],
+    fasttrack: bool = False,
 ) -> ExecutionPlan:
     forward_graph = build_forward_graph(config)
     affected = compute_affected(forward_graph, changed)
@@ -350,8 +352,10 @@ def compute_plan(
             # Fork every gate into one step per certification lane. Both
             # lanes run against the same staged toolchain and the same
             # staged package set; only the gate-execution env differs
-            # (DRIFT_DEBUG selects the runtime at link time).
-            for lane in _LANES:
+            # (DRIFT_DEBUG selects the runtime at link time). In
+            # fasttrack mode only the normal lane runs.
+            active_lanes = ("normal",) if fasttrack else _LANES
+            for lane in active_lanes:
                 for gate in ("test", "stress", "perf"):
                     if gate in repo.commands:
                         steps.append({
@@ -369,6 +373,7 @@ def compute_plan(
         involved_repos=involved,
         validated_repos=validated,
         steps=steps,
+        fasttrack=fasttrack,
     )
 
 
@@ -384,6 +389,9 @@ def _dep_reason(repo: RepoConfig, changed: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def print_plan(plan: ExecutionPlan, config: OrchestrationConfig) -> None:
+    if plan.fasttrack:
+        print("Mode: FASTTRACK (debug-lane gates skipped)")
+        print()
     print("Candidate commits:")
     for r in plan.involved_repos:
         sha = plan.candidate_commits.get(r, "???")
@@ -434,6 +442,7 @@ def print_plan_json(plan: ExecutionPlan) -> None:
         "involved_repos": plan.involved_repos,
         "validated_repos": plan.validated_repos,
         "steps": plan.steps,
+        "fasttrack": plan.fasttrack,
     }
     print(json.dumps(obj, indent=2))
 
@@ -541,6 +550,8 @@ def generate_report(summary: dict) -> str:
     lines: list[str] = []
 
     lines.append(f"Certification Result: {verdict}")
+    if summary.get("fasttrack"):
+        lines.append("Mode: FASTTRACK (debug-lane gates skipped)")
     lines.append("")
     lines.append(f"Run: {run_id}")
 
@@ -625,6 +636,8 @@ def generate_report(summary: dict) -> str:
 def generate_report_short(summary: dict) -> str:
     """Generate report-short.txt content from a summary dict."""
     verdict = summary["verdict"].upper()
+    verdict_label = (f"{verdict} (FASTTRACK)"
+                     if summary.get("fasttrack") else verdict)
     commits = summary.get("candidate_commits", {})
     sources = summary.get("commit_sources", {})
     validated = summary.get("validated_repos", [])
@@ -641,7 +654,7 @@ def generate_report_short(summary: dict) -> str:
 
     if verdict == "CERTIFIED":
         validated_label = ", ".join(validated)
-        return (f"{verdict}: submitted {submitted_label}. "
+        return (f"{verdict_label}: submitted {submitted_label}. "
                 f"Validated: {validated_label}. {lock_msg}.")
     else:
         fail_step = _first_failure(summary)
@@ -649,15 +662,15 @@ def generate_report_short(summary: dict) -> str:
             reason = _failure_reason(summary)
             fail_lane = fail_step.get("lane")
             lane_label = f" [{fail_lane}]" if fail_lane else ""
-            return (f"{verdict}: submitted {submitted_label}. "
+            return (f"{verdict_label}: submitted {submitted_label}. "
                     f"First failure: {fail_step['repo']} "
                     f"{fail_step['name']}{lane_label} "
                     f"({reason}). {lock_msg}.")
         elif summary.get("block_reason"):
-            return (f"{verdict}: submitted {submitted_label}. "
+            return (f"{verdict_label}: submitted {submitted_label}. "
                     f"{summary['block_reason']}. {lock_msg}.")
         else:
-            return f"{verdict}: submitted {submitted_label}. {lock_msg}."
+            return f"{verdict_label}: submitted {submitted_label}. {lock_msg}."
 
 
 def _join_english(items: list[str]) -> str:
@@ -1341,6 +1354,8 @@ def execute_run(
 
     print(f"Run: {ctx.run_id}")
     print(f"Dir: {ctx.run_root}")
+    if plan.fasttrack:
+        print("Mode: FASTTRACK (debug-lane gates skipped)")
     print()
 
     # Materialize fresh checkouts for all involved repos.
@@ -1361,6 +1376,7 @@ def execute_run(
             summary = _build_summary(
                 ctx, config, plan, started_at, "blocked",
                 steps_results=[], block_reason=str(e),
+                fasttrack=plan.fasttrack,
             )
             _write_run_outputs(ctx, summary)
             return summary
@@ -1415,6 +1431,7 @@ def execute_run(
                     ctx, config, plan, started_at, "blocked",
                     steps_results=step_results,
                     block_reason=f"{_DUAL_RUNTIME_BLOCK_REASON}: {err}",
+                    fasttrack=plan.fasttrack,
                 )
                 _write_run_outputs(ctx, summary)
                 return summary
@@ -1546,6 +1563,7 @@ def execute_run(
                             ctx, config, plan, started_at, "blocked",
                             steps_results=step_results,
                             block_reason=f"run-snapshot refresh failed: {e}",
+                            fasttrack=plan.fasttrack,
                         )
                         _write_run_outputs(ctx, summary)
                         return summary
@@ -1647,6 +1665,7 @@ def execute_run(
         toolchain_version=toolchain_version,
         artifacts=artifacts,
         toolchain_commit_mismatch=toolchain_commit_mismatch,
+        fasttrack=plan.fasttrack,
     )
 
     _write_run_outputs(ctx, summary)
@@ -1766,6 +1785,7 @@ def _build_summary(
     toolchain_version: Optional[str] = None,
     artifacts: Optional[list[dict]] = None,
     toolchain_commit_mismatch: Optional[str] = None,
+    fasttrack: bool = False,
 ) -> dict:
     finished_at = datetime.now(timezone.utc)
     summary: dict = {
@@ -1806,6 +1826,8 @@ def _build_summary(
         summary["block_reason"] = block_reason
     if toolchain_commit_mismatch:
         summary["toolchain_commit_mismatch"] = toolchain_commit_mismatch
+    if fasttrack:
+        summary["fasttrack"] = True
     return summary
 
 
@@ -1891,6 +1913,13 @@ def promote_run(run_id: str, dest_root: Path) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if summary.get("fasttrack"):
+        print(
+            f"note: run {run_id} was a fasttrack run "
+            f"(debug-lane gates skipped — artifacts are complete, "
+            f"but debug-lane test coverage is absent)",
+        )
 
     staging = summary.get("staging", {})
     toolchain_root_str = staging.get("toolchain_root", "")
@@ -2032,11 +2061,21 @@ def main() -> None:
         action="store_true",
         help="Output plan as JSON",
     )
+    plan_parser.add_argument(
+        "--fasttrack",
+        action="store_true",
+        help="Skip debug-lane gates (test/stress/perf). Build artifacts are still complete; debug-lane test coverage is absent.",
+    )
 
     certify_parser = sub.add_parser("certify", help="Execute a certification run")
     certify_parser.add_argument(
         "input_file",
         help="JSON file mapping repo names to candidate commit SHAs",
+    )
+    certify_parser.add_argument(
+        "--fasttrack",
+        action="store_true",
+        help="Skip debug-lane gates (test/stress/perf). Build artifacts are still complete; debug-lane test coverage is absent.",
     )
 
     promote_parser = sub.add_parser(
@@ -2071,7 +2110,7 @@ def main() -> None:
     config = OrchestrationConfig.load(config_path)
 
     if args.command in ("plan", "certify"):
-        plan = _load_and_plan(config, args.input_file)
+        plan = _load_and_plan(config, args.input_file, fasttrack=args.fasttrack)
         if plan is None:
             sys.exit(0)
 
@@ -2086,7 +2125,7 @@ def main() -> None:
 
 
 def _load_and_plan(
-    config: OrchestrationConfig, input_file: str
+    config: OrchestrationConfig, input_file: str, *, fasttrack: bool = False,
 ) -> Optional[ExecutionPlan]:
     """Shared input validation and plan computation for plan/certify commands."""
     input_path = Path(input_file)
@@ -2113,7 +2152,7 @@ def _load_and_plan(
         print("No repos changed relative to certified snapshot.")
         return None
 
-    return compute_plan(config, commits, sources, changed)
+    return compute_plan(config, commits, sources, changed, fasttrack=fasttrack)
 
 
 if __name__ == "__main__":
