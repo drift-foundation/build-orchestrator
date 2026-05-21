@@ -26,12 +26,18 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _RUN_SNAPSHOT_FORMAT = "drift-run-snapshot"
 _RUN_SNAPSHOT_VERSION = 0
 
-# Sidecar format constants (mirrored from drift-lang).
-_SOURCE_ATTESTATION_FORMAT = "drift-source-attestation"
-_SOURCE_ATTESTATION_VERSION = 0
-_SOURCE_ATTESTATION_BODY_SCHEMA_VERSION = 1
-_PKG_SIG_FORMAT = "dmir-pkg-sig"
-_PKG_SIG_VERSION = 0
+# Sidecar format constants (mirrored from drift-lang, trust-v1).
+# A v1 staged package has two JSON sidecars next to its .zdmp:
+#   <base>.author-claim                   — signed by the package author
+#   <base>.cert-claim.<kid>.json          — signed by the certifier; one
+#                                            per cert suite (sorted-first
+#                                            wins, matching resolver)
+_AUTHOR_CLAIM_FORMAT = "drift-author-claim"
+_AUTHOR_CLAIM_VERSION = 1
+_AUTHOR_CLAIM_BODY_SCHEMA_VERSION = 1
+_CERT_CLAIM_FORMAT = "drift-cert-claim"
+_CERT_CLAIM_VERSION = 1
+_CERT_CLAIM_BODY_SCHEMA_VERSION = 1
 
 # Strict validators for run-snapshot field shapes. The toolchain's
 # loader is strict; orch enforces the same shapes at emit time so
@@ -831,10 +837,22 @@ def toolchain_supports_provenance(version_output: Optional[str]) -> bool:
 def scan_staged_artifacts(libs_root: Path) -> list[dict]:
     """Scan the staged libs root for deployed artifacts.
 
-    Returns a list of artifact records with paths to the artifact,
-    sig, author-profile, and provenance bundle if present.
+    Returns a list of artifact records carrying paths to the trust-v1
+    sidecars that sit next to each ``.zdmp``:
+
+    - ``artifact_path``       — the package itself (``<base>.zdmp``)
+    - ``author_claim_path``   — ``<base>.author-claim`` (single)
+    - ``cert_claim_paths``    — sorted list of ``<base>.cert-claim.*.json``
+                                (one entry per cert suite; usually one,
+                                possibly more)
+    - ``author_profile_path`` — ``<base>.author-profile``
+    - ``provenance_path``     — ``<base>.provenance.zst`` (or ``None`` if
+                                missing, so completeness checks can
+                                detect it explicitly)
+
+    Descriptive only — records what's on disk. Strict trust-v1
+    validation lives in ``build_run_snapshot``.
     """
-    artifacts: list[str] = []
     if not libs_root.exists():
         return []
 
@@ -852,16 +870,21 @@ def scan_staged_artifacts(libs_root: Path) -> list[dict]:
                 "version": version,
             }
 
-            # Look for known artifact files.
+            # Look for known artifact files (trust-v1 layout).
             zdmp = version_dir / f"{artifact_name}.zdmp"
-            sig = version_dir / f"{artifact_name}.sig"
+            author_claim = version_dir / f"{artifact_name}.author-claim"
+            cert_claims = sorted(
+                version_dir.glob(f"{artifact_name}.cert-claim.*.json")
+            )
             author_profile = version_dir / f"{artifact_name}.author-profile"
             provenance = version_dir / f"{artifact_name}.provenance.zst"
 
             if zdmp.exists():
                 record["artifact_path"] = str(zdmp)
-            if sig.exists():
-                record["sig_path"] = str(sig)
+            if author_claim.exists():
+                record["author_claim_path"] = str(author_claim)
+            if cert_claims:
+                record["cert_claim_paths"] = [str(p) for p in cert_claims]
             if author_profile.exists():
                 record["author_profile_path"] = str(author_profile)
             if provenance.exists():
@@ -922,99 +945,76 @@ def _read_sidecar_json(path: Path, *, where: str) -> dict:
     return obj
 
 
-def _extract_attestation_fields(
-    attest_path: Path, zdmp: Path,
+def _extract_claim_fields(
+    claim_path: Path, zdmp: Path, *,
+    expected_format: str,
+    expected_version: int,
+    expected_body_schema_version: int,
+    kind: str,
 ) -> tuple[str, str, str, str]:
-    """Parse a `.source-attestation` sidecar. Returns
-    (package_id, version, source_content_id, source_attestation_key).
+    """Parse a trust-v1 claim sidecar (author-claim or cert-claim).
+
+    Returns ``(package_id, version, source_content_id, signer_kid)``,
+    where ``signer_kid`` is the first signature's kid. Both claim
+    shapes share the same outer envelope and body fields, so one
+    extractor parses both — the caller distinguishes by passing the
+    expected format constants.
+
     Strict on every field; raises RunSnapshotError on any violation."""
-    where = f"source-attestation for {zdmp.name}"
-    obj = _read_sidecar_json(attest_path, where=where)
+    where = f"{kind} for {zdmp.name}"
+    obj = _read_sidecar_json(claim_path, where=where)
     fmt = obj.get("format")
-    if fmt != _SOURCE_ATTESTATION_FORMAT:
+    if fmt != expected_format:
         raise RunSnapshotError(
-            f"{where} ({attest_path}): expected format "
-            f"{_SOURCE_ATTESTATION_FORMAT!r}, got {fmt!r}"
+            f"{where} ({claim_path}): expected format "
+            f"{expected_format!r}, got {fmt!r}"
         )
     ver = obj.get("version")
-    if ver != _SOURCE_ATTESTATION_VERSION:
+    if ver != expected_version:
         raise RunSnapshotError(
-            f"{where} ({attest_path}): expected version "
-            f"{_SOURCE_ATTESTATION_VERSION}, got {ver!r}"
+            f"{where} ({claim_path}): expected version "
+            f"{expected_version}, got {ver!r}"
         )
     body = obj.get("body")
     if not isinstance(body, dict):
         raise RunSnapshotError(
-            f"{where} ({attest_path}): 'body' must be a JSON object"
+            f"{where} ({claim_path}): 'body' must be a JSON object"
         )
     body_sv = body.get("schema_version")
-    if body_sv != _SOURCE_ATTESTATION_BODY_SCHEMA_VERSION:
+    if body_sv != expected_body_schema_version:
         raise RunSnapshotError(
-            f"{where} ({attest_path}): body.schema_version {body_sv!r} != "
-            f"{_SOURCE_ATTESTATION_BODY_SCHEMA_VERSION}"
+            f"{where} ({claim_path}): body.schema_version {body_sv!r} != "
+            f"{expected_body_schema_version}"
         )
     pkg_id = body.get("package_id")
     version = body.get("version")
     if not isinstance(pkg_id, str) or not pkg_id:
         raise RunSnapshotError(
-            f"{where} ({attest_path}): missing or empty body.package_id"
+            f"{where} ({claim_path}): missing or empty body.package_id"
         )
     if not isinstance(version, str) or not version:
         raise RunSnapshotError(
-            f"{where} ({attest_path}): missing or empty body.version"
+            f"{where} ({claim_path}): missing or empty body.version"
         )
     scid = _validate_sha256_hex_id(
         body.get("source_content_id"),
-        where=f"{where} ({attest_path}) body",
+        where=f"{where} ({claim_path}) body",
     )
     sigs = obj.get("signatures")
     if not isinstance(sigs, list) or not sigs:
         raise RunSnapshotError(
-            f"{where} ({attest_path}): 'signatures' must be a non-empty list"
+            f"{where} ({claim_path}): 'signatures' must be a non-empty list"
         )
     first = sigs[0]
     if not isinstance(first, dict):
         raise RunSnapshotError(
-            f"{where} ({attest_path}): signatures[0] must be a JSON object"
+            f"{where} ({claim_path}): signatures[0] must be a JSON object"
         )
-    attest_kid = _validate_ed25519_kid(
+    kid = _validate_ed25519_kid(
         first.get("kid"),
-        where=f"{where} ({attest_path}) signatures[0].kid",
+        where=f"{where} ({claim_path}) signatures[0].kid",
     )
-    return pkg_id, version, scid, attest_kid
-
-
-def _extract_sig_author_kid(sig_path: Path, zdmp: Path) -> str:
-    """Parse a `.sig` sidecar. Returns the first signer's kid (author_key).
-    Strict; raises RunSnapshotError on any violation."""
-    where = f"sig sidecar for {zdmp.name}"
-    obj = _read_sidecar_json(sig_path, where=where)
-    fmt = obj.get("format")
-    if fmt != _PKG_SIG_FORMAT:
-        raise RunSnapshotError(
-            f"{where} ({sig_path}): expected format {_PKG_SIG_FORMAT!r}, "
-            f"got {fmt!r}"
-        )
-    ver = obj.get("version")
-    if ver != _PKG_SIG_VERSION:
-        raise RunSnapshotError(
-            f"{where} ({sig_path}): expected version {_PKG_SIG_VERSION}, "
-            f"got {ver!r}"
-        )
-    sigs = obj.get("signatures")
-    if not isinstance(sigs, list) or not sigs:
-        raise RunSnapshotError(
-            f"{where} ({sig_path}): 'signatures' must be a non-empty list"
-        )
-    first = sigs[0]
-    if not isinstance(first, dict):
-        raise RunSnapshotError(
-            f"{where} ({sig_path}): signatures[0] must be a JSON object"
-        )
-    return _validate_ed25519_kid(
-        first.get("kid"),
-        where=f"{where} ({sig_path}) signatures[0].kid",
-    )
+    return pkg_id, version, scid, kid
 
 
 def _write_snapshot_atomic(snapshot: dict, out_path: Path) -> None:
@@ -1050,19 +1050,37 @@ def write_empty_run_snapshot(run_id: str, out_path: Path) -> dict:
 def build_run_snapshot(
     libs_root: Path, run_id: str, out_path: Path,
 ) -> dict:
-    """Walk the staged libs root, read each package's
-    `.source-attestation` + `.sig` sidecars, and emit a v0 run snapshot
-    at `out_path`. Strict on every field; raises RunSnapshotError on
-    any violation. Builds the full entry dict in memory before writing
-    so partial snapshots never hit disk.
+    """Walk the staged libs root, read each package's trust-v1
+    ``.author-claim`` + ``.cert-claim.<kid>.json`` sidecars, and emit a
+    run snapshot at ``out_path``. Strict on every field; raises
+    RunSnapshotError on any violation. Builds the full entry dict in
+    memory before writing so partial snapshots never hit disk.
 
     Write is atomic: final path is rename-swapped from a sibling tmp
     file. A gate step starting concurrently could otherwise observe
     truncated JSON and fail with an opaque parse error.
 
-    Asserts the attestation body's `package_id` / `version` match the
+    Asserts the claim bodies' ``package_id`` / ``version`` match the
     on-disk directory layout; mismatches are a hard failure so the
     resolver and snapshot cannot disagree on what a key refers to.
+    Also asserts the author and cert claims agree on
+    ``source_content_id`` — disagreement means the cert was minted
+    against a different source than the author signed.
+
+    Snapshot schema field names are preserved (``author_key`` and
+    ``source_attestation_key``) but populated with **v1 semantics**:
+
+    - ``author_key`` ← certifier kid (first signature of the cert-claim)
+    - ``source_attestation_key`` ← author kid (first signature of the
+      author-claim)
+
+    These names are stale; the downstream toolchain still expects them.
+    See ``resolver._read_author_key`` / ``_read_source_attestation_meta``
+    in drift-lang for the matching consumer.
+
+    Multiple cert-claims (one per cert suite) may sit next to a single
+    author-claim. We pick the deterministic ``sorted-first`` cert-claim,
+    matching the resolver's tie-break rule.
     """
     if not libs_root.exists():
         raise RunSnapshotError(f"staged libs_root missing: {libs_root}")
@@ -1083,53 +1101,99 @@ def build_run_snapshot(
                 continue
             for zdmp in zdmps:
                 base = zdmp.stem
-                attest_path = version_dir / f"{base}.source-attestation"
-                sig_path = version_dir / f"{base}.sig"
-                if not attest_path.exists():
-                    raise RunSnapshotError(
-                        f"staged package {zdmp} is missing required "
-                        f"sidecar: {attest_path}"
-                    )
-                if not sig_path.exists():
-                    raise RunSnapshotError(
-                        f"staged package {zdmp} is missing required "
-                        f"sidecar: {sig_path}"
-                    )
-                pkg_id, version, scid, attest_kid = (
-                    _extract_attestation_fields(attest_path, zdmp)
+                author_path = version_dir / f"{base}.author-claim"
+                cert_paths = sorted(
+                    version_dir.glob(f"{base}.cert-claim.*.json")
                 )
-                # Asserted invariant: the attestation's declared
-                # identity matches the directory layout the resolver
-                # walks. Divergence means the snapshot key would
-                # disagree with how the resolver addresses the
-                # package — fail here, not at consume time.
-                if pkg_id != artifact_dir.name:
+                if not author_path.exists():
                     raise RunSnapshotError(
-                        f"attestation body.package_id {pkg_id!r} for "
-                        f"{zdmp} does not match on-disk directory name "
-                        f"{artifact_dir.name!r}"
+                        f"staged package {zdmp} is missing required "
+                        f"sidecar: {author_path}"
                     )
-                if version != version_dir.name:
+                if not cert_paths:
                     raise RunSnapshotError(
-                        f"attestation body.version {version!r} for "
-                        f"{zdmp} does not match on-disk directory name "
-                        f"{version_dir.name!r}"
+                        f"staged package {zdmp} has no cert-claim "
+                        f"sidecar (expected {base}.cert-claim.<kid>.json "
+                        f"under {version_dir})"
                     )
-                author_kid = _extract_sig_author_kid(sig_path, zdmp)
+                # Deterministic tie-break: first sorted cert-claim wins,
+                # matching the resolver. This is stable across runs as
+                # long as no cert-claim is added or removed.
+                cert_path = cert_paths[0]
+
+                author_pkg, author_ver, author_scid, author_kid = (
+                    _extract_claim_fields(
+                        author_path, zdmp,
+                        expected_format=_AUTHOR_CLAIM_FORMAT,
+                        expected_version=_AUTHOR_CLAIM_VERSION,
+                        expected_body_schema_version=
+                            _AUTHOR_CLAIM_BODY_SCHEMA_VERSION,
+                        kind="author-claim",
+                    )
+                )
+                cert_pkg, cert_ver, cert_scid, cert_kid = (
+                    _extract_claim_fields(
+                        cert_path, zdmp,
+                        expected_format=_CERT_CLAIM_FORMAT,
+                        expected_version=_CERT_CLAIM_VERSION,
+                        expected_body_schema_version=
+                            _CERT_CLAIM_BODY_SCHEMA_VERSION,
+                        kind="cert-claim",
+                    )
+                )
+
+                # Asserted invariant: both claims' declared identity
+                # matches the directory layout the resolver walks.
+                # Divergence means the snapshot key would disagree with
+                # how the resolver addresses the package — fail here,
+                # not at consume time.
+                for label, pkg_val, ver_val, claim_path in (
+                    ("author-claim", author_pkg, author_ver, author_path),
+                    ("cert-claim",   cert_pkg,   cert_ver,   cert_path),
+                ):
+                    if pkg_val != artifact_dir.name:
+                        raise RunSnapshotError(
+                            f"{label} body.package_id {pkg_val!r} for "
+                            f"{zdmp} does not match on-disk directory "
+                            f"name {artifact_dir.name!r} "
+                            f"({claim_path})"
+                        )
+                    if ver_val != version_dir.name:
+                        raise RunSnapshotError(
+                            f"{label} body.version {ver_val!r} for "
+                            f"{zdmp} does not match on-disk directory "
+                            f"name {version_dir.name!r} ({claim_path})"
+                        )
+
+                # Asserted invariant: the cert binds to the same source
+                # the author signed. If these diverge the cert is
+                # vouching for a different source than the package
+                # actually contains.
+                if author_scid != cert_scid:
+                    raise RunSnapshotError(
+                        f"source_content_id mismatch between author and "
+                        f"cert claims for {zdmp}: "
+                        f"author={author_scid} ({author_path}) vs "
+                        f"cert={cert_scid} ({cert_path})"
+                    )
+
                 zdmp_sha = hashlib.sha256(zdmp.read_bytes()).hexdigest()
-                key = (pkg_id, version)
+                key = (author_pkg, author_ver)
+                # Field names preserved for the downstream toolchain;
+                # see the function docstring for v1 semantics.
                 new_entry = {
-                    "source_content_id": scid,
-                    "author_key": author_kid,
-                    "source_attestation_key": attest_kid,
+                    "source_content_id": author_scid,
+                    "author_key": cert_kid,
+                    "source_attestation_key": author_kid,
                     "sha256": zdmp_sha,
                 }
                 if key in entries:
                     if entries[key] != new_entry:
                         raise RunSnapshotError(
                             f"conflicting run-snapshot entries for "
-                            f"{pkg_id}@{version}: same (pkg_id, version) "
-                            f"seen twice with different metadata:\n"
+                            f"{author_pkg}@{author_ver}: same "
+                            f"(pkg_id, version) seen twice with "
+                            f"different metadata:\n"
                             f"  first: {entries[key]}\n"
                             f"  again: {new_entry}"
                         )
@@ -1784,6 +1848,39 @@ def execute_run(
     return summary
 
 
+_ARTIFACT_PATH_KEYS: tuple[tuple[str, str], ...] = (
+    # (record-key, display-label). Order = trust lineage: package,
+    # author signature, cert signature(s), author identity, build provenance.
+    ("artifact_path",       "artifact"),
+    ("author_claim_path",   "author claim"),
+    ("cert_claim_paths",    "cert claim"),
+    ("author_profile_path", "author profile"),
+    ("provenance_path",     "provenance"),
+)
+
+
+def _artifact_path_lines(
+    art: dict, rewrite: Optional[callable] = None,
+) -> list[str]:
+    """Render the sidecar-paths block for one artifact record.
+
+    *rewrite*, if given, is applied to each path string (used by
+    ``promote_run`` to re-root paths under ``libs/``). The same renderer
+    is used by the in-run ``artifacts.txt`` and the promoted snapshot's
+    ``artifacts.txt`` so both stay in sync as new sidecars appear.
+    """
+    lines: list[str] = []
+    for key, label in _ARTIFACT_PATH_KEYS:
+        value = art.get(key)
+        if not value:
+            continue
+        paths = value if isinstance(value, list) else [value]
+        for p in paths:
+            shown = rewrite(p) if rewrite else p
+            lines.append(f"  {label}: {shown}")
+    return lines
+
+
 def _generate_artifacts_txt(summary: dict) -> str:
     """Generate artifacts.txt listing all produced artifact paths."""
     lines: list[str] = []
@@ -1794,12 +1891,7 @@ def _generate_artifacts_txt(summary: dict) -> str:
 
     for art in artifacts:
         lines.append(f"{art['name']}@{art['version']}")
-        for key in ("artifact_path", "sig_path", "author_profile_path",
-                     "provenance_path"):
-            path = art.get(key)
-            if path:
-                label = key.replace("_path", "").replace("_", " ")
-                lines.append(f"  {label}: {path}")
+        lines.extend(_artifact_path_lines(art))
         lines.append("")
 
     return "\n".join(lines)
@@ -2106,22 +2198,18 @@ def promote_run(run_id: str, dest_root: Path) -> int:
     # paths from the summary relative to the snapshot's libs/ directory.
     artifacts = summary.get("artifacts", [])
     libs_root_str = staging.get("libs_root", "")
+
+    def _rereoot(src_path: str) -> str:
+        if libs_root_str and src_path.startswith(libs_root_str):
+            rel = src_path[len(libs_root_str):].lstrip("/")
+            return f"libs/{rel}"
+        return src_path
+
     art_lines: list[str] = []
     if artifacts:
         for art in artifacts:
             art_lines.append(f"{art['name']}@{art['version']}")
-            for key in ("artifact_path", "sig_path",
-                        "author_profile_path", "provenance_path"):
-                src_path = art.get(key, "")
-                if not src_path:
-                    continue
-                label = key.replace("_path", "").replace("_", " ")
-                # Re-root: strip the run-local libs root, prefix with libs/
-                if libs_root_str and src_path.startswith(libs_root_str):
-                    rel = src_path[len(libs_root_str):].lstrip("/")
-                    art_lines.append(f"  {label}: libs/{rel}")
-                else:
-                    art_lines.append(f"  {label}: {src_path}")
+            art_lines.extend(_artifact_path_lines(art, rewrite=_rereoot))
             art_lines.append("")
     else:
         art_lines.append("No artifacts produced.")
