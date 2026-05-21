@@ -54,6 +54,40 @@ class RepoConfig:
     commands: dict[str, list[str]]
 
 
+# ---------------------------------------------------------------------------
+# Trust-v1 cert-suite policy
+#
+# `drift deploy` emits a v1 cert claim on every invocation. The cert-suite
+# policy decides what evidence backs the claim. The orchestrator owns this
+# policy because it is the certifier/distributor — project repos must NOT
+# specify cert-suite flags in their command recipes.
+#
+# Two phases:
+#   - "stage"   : producer staging (e.g. stage_packages). No standalone
+#                 evidence artifact yet → orch passes --cert-suite-no-evidence.
+#   - "release" : real release/promotion. Orch computes the evidence digest
+#                 from the run's report/log/archive and passes
+#                 --cert-suite-evidence-sha256 sha256:<digest>. NOT YET WIRED.
+#
+# Policy lives at the top of orchestration.json under "cert_suite_policy"
+# (action → {phase, suite_id}). A default is applied when the field is
+# missing so existing configs continue to work.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CERT_SUITE_POLICY: dict = {
+    "stage_packages": {
+        "phase": "stage",
+        "suite_id": "orch/stage-packages",
+    },
+}
+
+_CERT_SUITE_FLAGS = (
+    "--cert-suite-id",
+    "--cert-suite-evidence-sha256",
+    "--cert-suite-no-evidence",
+)
+
+
 @dataclass
 class OrchestrationConfig:
     schema_version: int
@@ -62,6 +96,7 @@ class OrchestrationConfig:
     state_root: str
     repos: dict[str, RepoConfig]
     environment: dict
+    cert_suite_policy: dict = field(default_factory=dict)
     config_name: str = "orchestration"
 
     @staticmethod
@@ -79,15 +114,19 @@ class OrchestrationConfig:
             )
         # Derive config_name from the filename, stripping .json.
         config_name = path.stem
-        return OrchestrationConfig(
+        cert_suite_policy = raw.get("cert_suite_policy") or _DEFAULT_CERT_SUITE_POLICY
+        config = OrchestrationConfig(
             schema_version=raw["schema_version"],
             workspace_root=raw["workspace"]["root"],
             run_root=raw["workspace"]["run_root"],
             state_root=raw["workspace"]["state_root"],
             repos=repos,
             environment=raw.get("environment", {}),
+            cert_suite_policy=cert_suite_policy,
             config_name=config_name,
         )
+        _validate_repo_recipes(config)
+        return config
 
     @property
     def lock_filename(self) -> str:
@@ -96,6 +135,65 @@ class OrchestrationConfig:
     @property
     def lock_path(self) -> Path:
         return Path(self.state_root) / self.lock_filename
+
+
+def _validate_repo_recipes(config: OrchestrationConfig) -> None:
+    """Reject repo recipes that try to specify cert-suite flags directly.
+
+    Cert-suite policy is owned by the orchestrator (see
+    ``cert_suite_policy`` in orchestration.json). A repo recipe that
+    embeds ``--cert-suite-id`` etc. would shadow orch policy and split
+    the contract across actors. Fail fast at config load.
+    """
+    for repo_name, repo in config.repos.items():
+        for action, cmd in repo.commands.items():
+            if not isinstance(cmd, list):
+                continue
+            for token in cmd:
+                if token in _CERT_SUITE_FLAGS:
+                    raise ValueError(
+                        f"repo {repo_name!r} command {action!r} contains "
+                        f"{token!r}; cert-suite policy is orch-owned. "
+                        f"Move it to orchestration.json:cert_suite_policy "
+                        f"and remove the flag from the recipe."
+                    )
+
+
+def apply_cert_suite_policy(
+    command: list[str], action: str, policy: dict,
+) -> list[str]:
+    """Return *command* with cert-suite flags appended per orch policy.
+
+    *policy* is the map declared at ``orchestration.json:cert_suite_policy``,
+    keyed by action name (e.g. ``"stage_packages"``). If *action* has no
+    entry, *command* is returned unchanged.
+    """
+    entry = policy.get(action)
+    if not entry:
+        return command
+    phase = entry.get("phase")
+    suite_id = entry.get("suite_id")
+    if not suite_id:
+        raise ValueError(
+            f"cert_suite_policy[{action!r}] missing 'suite_id'"
+        )
+    if phase == "stage":
+        return list(command) + [
+            "--cert-suite-id", suite_id,
+            "--cert-suite-no-evidence",
+        ]
+    if phase == "release":
+        # Release phase needs a runtime-computed evidence digest from
+        # the run's report/log/archive. Not yet wired — the promote path
+        # will assemble it when implemented.
+        raise NotImplementedError(
+            f"cert_suite_policy[{action!r}].phase = 'release' "
+            f"requires evidence-digest emission (not yet implemented)"
+        )
+    raise ValueError(
+        f"cert_suite_policy[{action!r}].phase = {phase!r} "
+        f"(expected 'stage' or 'release')"
+    )
 
 
 @dataclass
@@ -365,6 +463,14 @@ def compute_plan(
                             "command": repo.commands[gate],
                             "reason": validation_reason,
                         })
+
+    # Inject orch-owned cert-suite policy into every step whose action
+    # is declared in cert_suite_policy. The helper is a no-op for actions
+    # not in the policy map.
+    for step in steps:
+        step["command"] = apply_cert_suite_policy(
+            step["command"], step["action"], config.cert_suite_policy,
+        )
 
     return ExecutionPlan(
         candidate_commits=commits,

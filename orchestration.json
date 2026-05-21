@@ -67,5 +67,11 @@
       "DRIFT_PACKAGE_ROOT": "{libs_root}",
       "DRIFT_PKG_ROOT": "{libs_root}"
     }
+  },
+  "cert_suite_policy": {
+    "stage_packages": {
+      "phase": "stage",
+      "suite_id": "orch/stage-packages"
+    }
   }
 }

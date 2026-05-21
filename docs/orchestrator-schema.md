@@ -90,6 +90,12 @@ Suggested shape:
       "DRIFT_PACKAGE_ROOT": "{libs_root}",
       "DRIFT_PKG_ROOT": "{libs_root}"
     }
+  },
+  "cert_suite_policy": {
+    "stage_packages": {
+      "phase": "stage",
+      "suite_id": "orch/stage-packages"
+    }
   }
 }
 ```
@@ -103,6 +109,46 @@ Notes:
 - `drift-lang` is a toolchain input and never a validation target
 - `changed_repos` may include repos that triggered the run but were not themselves validation targets
 - reports should still attribute downstream failures to the triggering candidate repos for team decision-making
+
+### Cert-suite policy (trust-v1)
+
+`drift deploy` emits a v1 cert claim on every invocation and requires
+explicit cert-suite evidence policy. The orchestrator owns this policy
+— **project repos must not specify `--cert-suite-id`,
+`--cert-suite-evidence-sha256`, or `--cert-suite-no-evidence` in their
+recipes**. Config load rejects any repo command that contains one of
+these flags.
+
+The `cert_suite_policy` field is a map from action name (e.g.
+`stage_packages`) to an entry of the form:
+
+```json
+{
+  "phase": "stage" | "release",
+  "suite_id": "<suite-id-string>"
+}
+```
+
+Two phases:
+
+- **`stage`** — producer staging. The action produces an artifact but
+  no standalone evidence artifact exists yet. Orch appends
+  `--cert-suite-id <suite-id> --cert-suite-no-evidence`. Use this for
+  `stage_packages` (suite id by convention: `orch/stage-packages`).
+- **`release`** — release/promotion. The cert claim binds to a real
+  evidence artifact (digest of report / log / archive). Orch will
+  append `--cert-suite-id <release-suite-id>
+  --cert-suite-evidence-sha256 sha256:<digest>` with the digest
+  computed at runtime. *Not yet wired*: the promote path will assemble
+  this when implemented.
+
+If `cert_suite_policy` is omitted from `orchestration.json`, the
+orchestrator falls back to the built-in default (a `stage`-phase entry
+for `stage_packages` with suite id `orch/stage-packages`) so existing
+configs continue to work.
+
+Policy is applied at step-construction time in `compute_plan`; actions
+not present in the policy map pass through unchanged.
 
 ## 2. `build/runs/<run-id>/summary.json`
 
