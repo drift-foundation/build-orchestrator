@@ -421,12 +421,12 @@ def compute_plan(
     for repo_name in involved:
         repo = config.repos[repo_name]
         if repo.kind == "toolchain":
-            if "bootstrap" in repo.commands:
+            if "setup_venv" in repo.commands:
                 steps.append({
                     "repo": repo_name,
-                    "action": "bootstrap",
-                    "command": repo.commands["bootstrap"],
-                    "reason": "toolchain venv setup",
+                    "action": "setup_venv",
+                    "command": repo.commands["setup_venv"],
+                    "reason": "create build venv + install deps and pex",
                 })
             if "stage_toolchain" in repo.commands:
                 steps.append({
@@ -586,7 +586,7 @@ def _repo_results(summary: dict) -> dict[tuple[str, str], str]:
         if repo not in validated:
             continue
         # Only certification gates contribute to lane verdicts; infra
-        # steps (bootstrap, stage_*) are not validation.
+        # steps (setup_venv, stage_*) are not validation.
         if step.get("name") not in _CERTIFICATION_GATES:
             continue
         lane = step.get("lane") or "normal"
@@ -1473,7 +1473,7 @@ def build_step_env(
     # Certification-phase selector. stage_packages = producer role
     # (DRIFT_CERT_MODE=stage). Certification gates = consumer role
     # (DRIFT_CERT_MODE=certify + DRIFT_RUN_SNAPSHOT=<path>). All
-    # other steps (bootstrap, stage_toolchain) leave the env unset —
+    # other steps (setup_venv, stage_toolchain) leave the env unset —
     # drift-lang's own build machinery is not a certification surface.
     # The retired DRIFT_SOURCE_REBUILD is hard-rejected by 0.31.5+; we
     # explicitly scrub any inherited value so an operator's shell can't
@@ -1509,10 +1509,185 @@ def build_step_env(
         )
         env["PATH"] = staged_bin + os.pathsep + scrubbed
     else:
-        # Infra steps (bootstrap, stage_*): keep full PATH for flexibility.
+        # Infra steps (setup_venv, stage_*): keep full PATH for flexibility.
         env["PATH"] = staged_bin + os.pathsep + env.get("PATH", "")
 
     return env
+
+
+def _library_artifacts(manifest_path: Path) -> list[str]:
+    """Return the names of library artifacts declared in a manifest.
+
+    Author claims are minted per library artifact, so these are exactly
+    the artifacts `drift author verify` (and `drift deploy`) check.
+    """
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    names: list[str] = []
+    for art in manifest.get("artifacts", []):
+        if art.get("kind", "library") == "library" and art.get("name"):
+            names.append(art["name"])
+    return names
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Human-friendly step duration: '4.2s', '1m03s', '2h05m'."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(round(seconds)), 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def run_author_claim_preflight(
+    config: OrchestrationConfig,
+    plan: ExecutionPlan,
+    ctx: "RunContext",
+    checkout_dirs: dict[str, Path],
+) -> Optional[str]:
+    """Fail-fast author-claim freshness gate.
+
+    Runs once the toolchain is staged (our base platform) and before any
+    package staging or certification gate. For every involved package
+    repo it verifies the committed author-claim still binds the
+    checked-out source, using the *staged* ``drift author verify`` — the
+    same self-contained toolchain binary that certifies packages, with
+    its own bundled interpreter. No orchestrator-side Python, no internal
+    module entrypoint: the platform validates its own consumers. The
+    check is keyless, build-free and side-effect-free, so a stale/missing
+    claim costs ~50ms per artifact instead of a full ``drift deploy``
+    plus the per-repo gate matrix the planner would otherwise run first.
+
+    Returns ``None`` if all claims are fresh — or if the staged toolchain
+    is too old to expose ``verify`` (skip with a warning; ``drift deploy``
+    still enforces it later). Returns a human-readable block reason if any
+    claim is stale or missing.
+    """
+    # Use the staged toolchain binary — the same `drift` that does the
+    # certification, with its own bundled runtime. stage_toolchain ran
+    # before us, so it exists.
+    staged_drift = (ctx.toolchain_root / "bin" / "drift").resolve()
+    if not staged_drift.is_file():
+        print("  preflight: author-claim verify ... SKIPPED "
+              "(staged drift binary not found)")
+        return None
+
+    # Every involved package repo that will be staged is a claim source —
+    # whether it is directly validated or pulled in as a dependency
+    # provider. This matches exactly the set `drift deploy` would check.
+    pkg_repos = [
+        r for r in plan.involved_repos
+        if config.repos[r].kind == "package_repo"
+        and "stage_packages" in config.repos[r].commands
+    ]
+
+    def _short_sci(value: Optional[str]) -> str:
+        # sha256:<64 hex> -> sha256:<first 10 hex>… for readable console output.
+        if not value:
+            return "?"
+        return value[:17] + "…" if len(value) > 18 else value
+
+    print("  preflight: author-claim verify ...", flush=True)
+    _t0 = time.monotonic()
+    failures: list[tuple[str, str]] = []
+    ok_count = 0
+    repos_checked = 0
+    for repo_name in pkg_repos:
+        manifest_path = (
+            checkout_dirs[repo_name] / "drift" / "manifest.json"
+        ).resolve()
+        artifacts = _library_artifacts(manifest_path)
+        print(f"    {repo_name}:")
+        if not artifacts:
+            print(f"      (no library artifacts in {manifest_path})")
+            failures.append((repo_name, "no library artifacts in manifest"))
+            continue
+        repos_checked += 1
+        # Sub-indent one artifact per line (a repo may declare 10s of them)
+        # and pad names so the status column lines up within the repo.
+        width = max(len(a) for a in artifacts)
+        for art in artifacts:
+            label = f"{repo_name}/{art}"
+            cmd = [
+                str(staged_drift), "author", "verify",
+                "--manifest", str(manifest_path),
+                "--artifact", art, "--json",
+            ]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=120,
+                )
+            except subprocess.TimeoutExpired:
+                print(f"      {art:<{width}}  TIMED OUT")
+                failures.append((label, "verify timed out"))
+                continue
+            try:
+                data = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                # An older toolchain has no `verify` subcommand at all.
+                if "invalid choice: 'verify'" in result.stderr:
+                    print(f"      {art:<{width}}  -")
+                    print("    SKIPPED: staged toolchain lacks `author "
+                          "verify`; deploy will enforce claims later")
+                    return None
+                detail = (result.stderr or result.stdout).strip() or "no output"
+                print(f"      {art:<{width}}  ERROR (exit {result.returncode})")
+                failures.append((label, f"unexpected verify output: {detail}"))
+                continue
+            status = data.get("status")
+            if status == "ok":
+                ok_count += 1
+                print(f"      {art:<{width}}  ok")
+            elif status == "stale":
+                sci = data.get("source_content_id", {})
+                detail = (f"STALE — claim {_short_sci(sci.get('claim'))} "
+                          f"≠ source {_short_sci(sci.get('computed'))}")
+                print(f"      {art:<{width}}  {detail}")
+                failures.append((label, detail))
+            elif status == "missing_claim":
+                print(f"      {art:<{width}}  MISSING author-claim")
+                failures.append((label, "MISSING author-claim"))
+            else:
+                print(f"      {art:<{width}}  unexpected status {status!r}")
+                failures.append((label, f"unexpected status {status!r}"))
+
+    # Report what we did NOT check, so "didn't verify" is never silently
+    # indistinguishable from "verified and fine".
+    skipped: list[str] = []
+    for repo_name in plan.involved_repos:
+        if repo_name in pkg_repos:
+            continue
+        kind = config.repos[repo_name].kind
+        if kind == "toolchain":
+            reason = "toolchain, no author-claims"
+        elif kind == "package_repo":
+            reason = "no stage_packages recipe"
+        else:
+            reason = kind
+        skipped.append(f"{repo_name} ({reason})")
+    if skipped:
+        print(f"    skipped: {', '.join(skipped)}")
+
+    _elapsed = time.monotonic() - _t0
+    if failures:
+        total = ok_count + len(failures)
+        print(f"  FAILED ({len(failures)} of {total} claim(s) bad, "
+              f"{_fmt_duration(_elapsed)})")
+        repos = sorted({label.split("/", 1)[0] for label, _ in failures})
+        print(f"    fix: re-run `drift author --overwrite` in "
+              f"{', '.join(repos)}, commit the refreshed .author-claim, "
+              f"then re-pin and re-run.")
+        return (
+            f"author-claim preflight failed for {len(failures)} artifact(s): "
+            + ", ".join(label for label, _ in failures)
+        )
+    print(f"  ok ({ok_count} claims fresh across {repos_checked} repos, "
+          f"{_fmt_duration(_elapsed)})")
+    return None
 
 
 def execute_run(
@@ -1565,6 +1740,7 @@ def execute_run(
     step_results: list[dict] = []
     verdict = "certified"
     dual_runtime_verified = False
+    claims_verified = False
     seen_artifacts: set[tuple[str, str]] = set()
 
     for step in plan.steps:
@@ -1581,6 +1757,25 @@ def execute_run(
             log_file = ctx.logs_root / f"{repo_name}.{action}.{lane}.log"
         else:
             log_file = ctx.logs_root / f"{repo_name}.{action}.log"
+
+        # Author-claim preflight: once, immediately before the first
+        # package staging. The toolchain (our base platform) is staged by
+        # now, so validate every package repo's claim with the staged
+        # `drift author verify` before we compile/sign or run any gate.
+        if action == "stage_packages" and not claims_verified:
+            claims_verified = True
+            block_reason = run_author_claim_preflight(
+                config, plan, ctx, checkout_dirs
+            )
+            if block_reason:
+                print(f"    {block_reason}", file=sys.stderr)
+                summary = _build_summary(
+                    ctx, config, plan, started_at, "blocked",
+                    steps_results=step_results, block_reason=block_reason,
+                    fasttrack=plan.fasttrack,
+                )
+                _write_run_outputs(ctx, summary)
+                return summary
 
         label = (f"[{repo_name}] {action} ({lane})" if lane
                  else f"[{repo_name}] {action}")
@@ -1668,15 +1863,16 @@ def execute_run(
                     lf.write(f"exit: {returncode}\n")
 
             step_finished = datetime.now(timezone.utc)
+            elapsed = (step_finished - step_started).total_seconds()
 
             if timed_out:
                 status = "failed"
                 verdict = "rejected"
-                print("TIMEOUT")
+                print(f"TIMEOUT ({_fmt_duration(elapsed)})")
                 print(f"    see: {log_file}")
             elif returncode == 0:
                 status = "passed"
-                print("ok")
+                print(f"ok ({_fmt_duration(elapsed)})")
                 if action == "stage_toolchain":
                     tc_ver = get_toolchain_version(ctx)
                     if tc_ver:
@@ -1727,6 +1923,7 @@ def execute_run(
                             "started_at": step_started.isoformat(),
                             "finished_at": datetime.now(
                                 timezone.utc).isoformat(),
+                            "duration_s": round(elapsed, 1),
                         }
                         step_results.append(step_record)
                         summary = _build_summary(
@@ -1768,17 +1965,19 @@ def execute_run(
                             )
 
                 if contract_violation:
-                    print("FAILED (contract violation: not using DRIFT_TOOLCHAIN_ROOT)")
+                    print(f"FAILED ({_fmt_duration(elapsed)}, contract "
+                          f"violation: not using DRIFT_TOOLCHAIN_ROOT)")
                 else:
-                    print("FAILED")
+                    print(f"FAILED ({_fmt_duration(elapsed)})")
                 print(f"    see: {log_file}")
 
         except FileNotFoundError as e:
             step_finished = datetime.now(timezone.utc)
+            elapsed = (step_finished - step_started).total_seconds()
             status = "blocked"
             verdict = "blocked"
             log_file.write_text(f"=== {label} ===\ncommand not found: {e}\n")
-            print("BLOCKED (command not found)")
+            print(f"BLOCKED (command not found, {_fmt_duration(elapsed)})")
 
         step_record: dict = {
             "repo": repo_name,
@@ -1789,6 +1988,7 @@ def execute_run(
             "log_path": str(log_file),
             "started_at": step_started.isoformat(),
             "finished_at": step_finished.isoformat(),
+            "duration_s": round(elapsed, 1),
         }
         if is_gate:
             step_record["certification_gate"] = True
@@ -1844,7 +2044,8 @@ def execute_run(
     if verdict == "certified":
         _update_workspace_lock(config, plan, ctx, summary)
 
-    print(f"Verdict: {verdict}")
+    total_elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+    print(f"Verdict: {verdict}  ({_fmt_duration(total_elapsed)} total)")
     return summary
 
 

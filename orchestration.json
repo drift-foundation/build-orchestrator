@@ -16,7 +16,7 @@
         "drift-web"
       ],
       "commands": {
-        "bootstrap": ["bash", "-c", "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/pip install pex"],
+        "setup_venv": ["bash", "-c", "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/pip install pex"],
         "stage_toolchain": ["just", "deploy", "--dest", "{toolchain_root}"]
       }
     },

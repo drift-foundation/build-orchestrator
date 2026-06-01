@@ -1,6 +1,6 @@
 {
-  "drift-lang": "790e846f7a6a4a878ff3293401702e97a8c0c631",
-  "drift-mariadb-client": "7ec90e3b1cfd3f2d10525ce53124a4dad672f262",
-  "drift-net-tls": "9d23e356be9eced69d5565432f659fce35543d19",
-  "drift-web": "aeb89b0584e2c8a7435c0a6ddaaf9d080c4271fd"
+  "drift-lang": "1ed1297754619e135f2b9dbb3336a8aefbd8908c",
+  "drift-mariadb-client": "4c6a8dcac9801a3b154be3152fddf2ad900077d8",
+  "drift-net-tls": "57c3361652a8c7b0105f9484d655bc7de79bed4f",
+  "drift-web": "dbf2538e142680c11da18fcb1b64fc59dc65415a"
 }
