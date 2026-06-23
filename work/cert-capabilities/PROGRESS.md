@@ -3,7 +3,7 @@
 Tracks where we stand against `PLAN.md`. Update statuses as work lands.
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
-_Last updated: 2026-06-23 — single-document contract; decisions locked; onboarding-doc added; second review folded in (version modeling, credential_env wording, always-write empty doc). Awaiting approval to implement._
+_Last updated: 2026-06-23 — IMPLEMENTED (orchestrator side). Steps 0–8 done and verified offline; not yet committed. Pending: real-host end-to-end + workflows-team adoption of the reader._
 
 ## Second-review resolutions (folded into PLAN)
 
@@ -30,7 +30,7 @@ _Last updated: 2026-06-23 — single-document contract; decisions locked; onboar
 
 ## Current state
 
-- **Phase:** planning; implementation NOT started.
+- **Phase:** orchestrator implementation COMPLETE + verified offline; not committed.
 - **Motivating failure:** run `20260623-134311-drift-workflows-63ac864`, `test` gate
   (`test-singular` → `_db-load-schema`): `error: mariachi venv missing`.
 - **Design (current):** `DRIFT_CERT_CAPABILITIES` → one resolved `capabilities.json` per run. The
@@ -47,38 +47,37 @@ _Last updated: 2026-06-23 — single-document contract; decisions locked; onboar
 - [x] **Approve** the `DRIFT_CERT_CAPABILITIES` + resolved-JSON standard. Names zero tool env vars →
       eliminates the mismatch class entirely.
 - Conditions to honor during implementation:
-  - [ ] `capabilities.json` is a **versioned public API**: keep `schema_version`, document the schema
-        normatively, additive-only changes without a bump.
+  - [x] `capabilities.json` is a **versioned public API**: `schema_version` emitted; schema documented
+        normatively in `orchestrator-schema.md` + onboarding doc (additive-only without a bump).
   - [ ] **Rollout ordering is the real cost:** orchestrator lands first (backward-compatible), but the
         red workflows gate stays red until drift-workflows ships a reader. Required coordinated ask to
-        the workflows team — not optional.
-  - [ ] `allocation`/`lock_key` are v1 **descriptive metadata** (repo self-serializes); orchestrator
-        does not enforce the lock yet. Don't over-promise.
-  - [ ] Confirm the secret named by `credential_env` is inherited by the gate process and not scrubbed.
-  - [ ] (Optional, future) toolchain-side accessor (`drift cert cap get …`) so repos don't each
-        hand-roll JSON parsing. Not required for v1.
+        the workflows team — not optional. *(message still to send)*
+  - [x] `allocation`/`lock_key` are v1 **descriptive metadata** (repo self-serializes); orchestrator
+        does not enforce the lock. Documented as such.
+  - [x] Secret named by `credential_env` is inherited by the gate process (`build_step_env` starts from
+        `dict(os.environ)`); orchestrator adds only `DRIFT_CERT_CAPABILITIES`. Preflight checks presence.
+  - [ ] (Optional, future) toolchain-side accessor (`drift cert cap get …`). Not required for v1.
 
 ## Steps
 
-- [~] **Step 0 — scaffolding.**
-  - [x] `work/cert-capabilities/PLAN.md` (single-document contract)
-  - [x] `work/cert-capabilities/PROGRESS.md`
-  - [ ] `.gitignore`: add `cert-env.json`, `state/cert-env.json`
-- [ ] **Step 1 — config model + load validation.** `Capability` (kind + policy fields);
-      `capabilities` parse; `RepoConfig.requires`; `_validate_capabilities`.
-- [ ] **Step 2 — host-local cert-env model.** `CertEnv` + `load()`; resolution order
+- [x] **Step 0 — scaffolding.** PLAN.md + PROGRESS.md; `.gitignore` adds `cert-env.json`, `state/cert-env.json`.
+- [x] **Step 1 — config model + load validation.** `Capability`, `capabilities` field + `_parse_capabilities`,
+      `RepoConfig.requires`, `_validate_capabilities` (structural + unknown-`requires` rejection).
+- [x] **Step 2 — host-local cert-env model.** `CertEnv` + `load()`; `_resolve_cert_env` order
       `--cert-env` → `DRIFT_CERT_ENV` → `./cert-env.json` → None.
-- [ ] **Step 3 — resolve + write per-run document.** `build_capabilities_document()` →
-      `<run-root>/capabilities.json` (`schema_version`, `run_id`, resolved required capabilities).
-- [ ] **Step 4 — inject single env var.** `build_step_env` sets `DRIFT_CERT_CAPABILITIES` for gate
-      steps only (no per-repo threading, no per-tool exports).
-- [ ] **Step 5 — preflight before staging.** `run_external_deps_preflight()` between lines 1818 and
-      1827; validate each required capability (tool exec, service tcp + `credential_env` present);
-      block-and-return; on pass write the document.
-- [ ] **Step 6 — CLI.** Global `--cert-env`; `certify` loads `CertEnv` → `execute_run`.
-- [ ] **Step 7 — config + docs.** `orchestration.json` `capabilities` (behavior only) + drift-workflows
-      `requires`; `cert-env.example.json`; document the `capabilities.json` schema in
-      `docs/orchestrator-schema.md`.
+- [x] **Step 3 — resolve + write per-run document.** `build_capabilities_document()` +
+      `write_capabilities_document()` → `<run-root>/capabilities.json` (always written, even empty).
+- [x] **Step 4 — inject single env var.** `build_step_env` sets `DRIFT_CERT_CAPABILITIES` for gate
+      steps only; no per-tool exports.
+- [x] **Step 5 — preflight before staging.** `run_external_deps_preflight()` (+ `_preflight_tool`/
+      `_preflight_service`, `_parse_semver`/`_version_at_least`) wired into `execute_run` after
+      checkouts, before snapshot; block-and-return; on pass writes the document.
+- [x] **Step 6 — CLI.** Global `--cert-env`; `certify` loads `CertEnv` → `execute_run`.
+- [x] **Step 7 — config + docs.** `orchestration.json` `capabilities` + drift-workflows `requires`;
+      `cert-env.example.json`; `capabilities.json` schema documented in `docs/orchestrator-schema.md`.
+- [x] **Step 8 — onboarding manual.** `docs/certification-onboarding.md` written (commands, depends_on,
+      committed staging + Lock v2, author-claim/trust-v1, `requires`, `DRIFT_CERT_CAPABILITIES` +
+      bash/Python examples, blocked-run behavior, evidence + certified/blocked/rejected).
 - [ ] **Step 8 — onboarding manual `docs/certification-onboarding.md`.** The formal "how to become
       certifiable" doc: required commands; direct-`depends_on`-only; committed-source staging + Lock v2;
       author-claim/trust-v1; `requires`; `DRIFT_CERT_CAPABILITIES` JSON contract + bash/Python examples;

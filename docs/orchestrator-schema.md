@@ -145,6 +145,92 @@ configs continue to work.
 Policy is applied at step-construction time in `compute_plan`; actions
 not present in the policy map pass through unchanged.
 
+### External capabilities (`DRIFT_CERT_CAPABILITIES`)
+
+Gates often need external resources that are neither package artifacts nor
+part of any repo checkout — a schema-migration tool, a database service, etc.
+A repo declares these as **named capabilities** it requires; the orchestrator
+resolves them and hands the gate **one resolved JSON document** via a single
+env var. The platform contract is `DRIFT_CERT_CAPABILITIES` + the document
+schema — **the orchestrator injects no per-tool env vars** (no `MARIACHI_BIN`,
+no `DB_HOST`). Repos read the document and adapt it internally.
+
+Three layers, three owners:
+
+| Layer | Where | Committed? | Owns |
+|---|---|---|---|
+| Repo author | repo `requires` | yes | which capabilities the gates need, by id |
+| Platform policy | top-level `capabilities` | yes (portable) | which capabilities exist; `kind`; **behavior only** |
+| Host resolution | `cert-env.json` (host-local) | **no** (gitignored) | machine **facts**: paths, host/port, credential env name |
+
+**Capability ids** are `tool:<name>` or `service:<name>`. A repo's `requires`
+is a list of ids; an id that names no declared capability is a load-time error.
+
+**Committed `capabilities`** carries *behavior policy only* — never host facts:
+
+```json
+"capabilities": {
+  "tool:mariachi":   { "kind": "tool", "min_version": "1.0.0",
+                       "version_argv": ["{bin}", "--version"] },
+  "service:mariadb": { "kind": "service", "allocation": "shared-exclusive" }
+}
+```
+
+- `min_version` / `version_argv` (tools, optional): the preflight runs the
+  probe (`{bin}` resolved host-locally), extracts the first semver-like token
+  from stdout+stderr, and compares numerically; omit them for a presence-only
+  check. **Preflight-only — never emitted into the run document.**
+- `allocation` (services): the behavior class (e.g. shared-exclusive) repos
+  read to self-serialize DB access. Descriptive in v1; the orchestrator does
+  not yet enforce a lock.
+
+**Host-local `cert-env.json`** supplies the machine facts, keyed by capability
+id. It is host/CI-specific and **never committed** (gitignored). Lookup order:
+`--cert-env <path>` → `$DRIFT_CERT_ENV` → `./cert-env.json`. See
+`cert-env.example.json`.
+
+```json
+{
+  "tool:mariachi":   { "bin": "/host/path/.venv/bin/mariachi" },
+  "service:mariadb": { "host": "127.0.0.1", "port": 34114,
+                       "credential_env": "MDB_ROOT_PWD",
+                       "instance": "mdb114-a", "lock_key": "mariadb-mdb114-a" }
+}
+```
+
+`credential_env` names the env var holding the secret — **the secret value
+never appears in any file**. The orchestrator validates it is set and inherits
+it by name into the gate environment; it adds only `DRIFT_CERT_CAPABILITIES`.
+
+**Preflight.** Before staging, the orchestrator validates every capability the
+run's validated repos require: the host must resolve it, a tool's `bin` must be
+executable (and meet `min_version`), a service's `credential_env` must be set
+and its `host:port` must accept a TCP connection. A gap **blocks the run** with
+a clear reason in seconds — not deep inside a gate after minutes of staging.
+
+**The run document** `build/runs/<run-id>/capabilities.json` is the resolved
+merge (committed behavior + host facts), the public API repos code against. It
+is **always written** (even empty) and the env var **always set** for gate
+steps, so consumers never special-case a missing file. Emitted fields per kind:
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "<run-id>",
+  "capabilities": {
+    "tool:mariachi":   { "kind": "tool", "bin": "<resolved path>" },
+    "service:mariadb": { "kind": "service", "allocation": "shared-exclusive",
+                         "host": "127.0.0.1", "port": 34114,
+                         "credential_env": "MDB_ROOT_PWD",
+                         "instance": "mdb114-a", "lock_key": "mariadb-mdb114-a" }
+  }
+}
+```
+
+`schema_version` is bumped only on incompatible changes; additive fields do not
+bump it. See `docs/certification-onboarding.md` for bash/Python consumption
+examples.
+
 ## 2. `build/runs/<run-id>/summary.json`
 
 Purpose:

@@ -4,3 +4,7 @@ build
 .codex-session
 .codex
 .claude-session
+
+# Host-local external-capability resolution (machine-specific; never commit).
+cert-env.json
+state/cert-env.json

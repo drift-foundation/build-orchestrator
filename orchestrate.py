@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -57,6 +58,33 @@ class RepoConfig:
     kind: str
     depends_on: list[str]
     commands: dict[str, list[str]]
+    requires: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Capability:
+    """A declared external capability (cert tool or service).
+
+    The committed ``capabilities`` section declares *behavior policy* only —
+    never host facts. Machine facts (paths, host/port, credential env names,
+    instance/lock ids) come from the host-local ``cert-env.json`` (see
+    ``CertEnv``); the per-run ``capabilities.json`` document is the resolved
+    merge that repos read via ``DRIFT_CERT_CAPABILITIES``.
+
+    Fields:
+      - ``id``           : the capability id, e.g. ``"tool:mariachi"``.
+      - ``kind``         : ``"tool"`` or ``"service"`` (derived from the id prefix).
+      - ``allocation``   : service behavior class, e.g. ``"shared-exclusive"``.
+      - ``min_version``  : optional tool minimum (preflight-only, not emitted).
+      - ``version_argv`` : optional tool version probe argv (``{bin}`` resolved
+                           host-locally; preflight-only, not emitted).
+    """
+    id: str
+    kind: str                          # authoritative, derived from the id prefix
+    declared_kind: Optional[str] = None  # explicit body `kind`, validated to match
+    allocation: Optional[str] = None
+    min_version: Optional[str] = None
+    version_argv: Optional[list[str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +130,7 @@ class OrchestrationConfig:
     repos: dict[str, RepoConfig]
     environment: dict
     cert_suite_policy: dict = field(default_factory=dict)
+    capabilities: dict[str, Capability] = field(default_factory=dict)
     config_name: str = "orchestration"
 
     @staticmethod
@@ -123,6 +152,7 @@ class OrchestrationConfig:
                 kind=r["kind"],
                 depends_on=r.get("depends_on", []),
                 commands=r.get("commands", {}),
+                requires=r.get("requires", []),
             )
         if stale_affects:
             raise ValueError(
@@ -133,6 +163,7 @@ class OrchestrationConfig:
         # Derive config_name from the filename, stripping .json.
         config_name = path.stem
         cert_suite_policy = raw.get("cert_suite_policy") or _DEFAULT_CERT_SUITE_POLICY
+        capabilities = _parse_capabilities(raw.get("capabilities", {}))
         config = OrchestrationConfig(
             schema_version=raw["schema_version"],
             workspace_root=raw["workspace"]["root"],
@@ -141,10 +172,12 @@ class OrchestrationConfig:
             repos=repos,
             environment=raw.get("environment", {}),
             cert_suite_policy=cert_suite_policy,
+            capabilities=capabilities,
             config_name=config_name,
         )
         _validate_repo_recipes(config)
         _validate_dependency_graph(config)
+        _validate_capabilities(config)
         return config
 
     @property
@@ -206,6 +239,87 @@ def _validate_dependency_graph(config: OrchestrationConfig) -> None:
         )
 
 
+_CAPABILITY_KINDS = ("tool", "service")
+
+
+def _parse_capabilities(raw: dict) -> dict[str, "Capability"]:
+    """Parse the committed ``capabilities`` section into Capability objects.
+
+    Ids are ``<kind>:<name>`` (e.g. ``"tool:mariachi"``); kind is derived from
+    the prefix. Only behavior policy is read here — host facts live in
+    ``cert-env.json``. Structural validity is enforced by
+    ``_validate_capabilities`` once the whole config is assembled.
+    """
+    caps: dict[str, Capability] = {}
+    for cap_id, body in raw.items():
+        kind = cap_id.split(":", 1)[0] if ":" in cap_id else ""
+        body = body or {}
+        caps[cap_id] = Capability(
+            id=cap_id,
+            kind=kind,
+            declared_kind=body.get("kind"),
+            allocation=body.get("allocation"),
+            min_version=body.get("min_version"),
+            version_argv=body.get("version_argv"),
+        )
+    return caps
+
+
+def _validate_capabilities(config: OrchestrationConfig) -> None:
+    """Validate the capability contract and every repo ``requires`` edge.
+
+    Two failure classes, both host-independent and surfaced at config load:
+      - structural: each capability id is ``tool:<name>`` / ``service:<name>``
+        with a known kind; an explicit ``kind`` field must match the id prefix;
+        ``version_argv`` (if present) is a list of strings; ``min_version`` (if
+        present) parses as a semver-like string.
+      - referential: every repo ``requires`` id names a declared capability —
+        same discipline as the unknown-``depends_on`` rejection. (Whether the
+        capability is *available on this host* is a separate, host-specific
+        check done by the preflight, not here.)
+    """
+    errors: list[str] = []
+    for cap_id, cap in config.capabilities.items():
+        if ":" not in cap_id or cap.kind not in _CAPABILITY_KINDS:
+            errors.append(
+                f"  capability {cap_id!r} must be '<kind>:<name>' with kind in "
+                f"{_CAPABILITY_KINDS}"
+            )
+        # An explicit `kind` in the body must agree with the id prefix, which is
+        # authoritative — otherwise `"tool:mariachi": {"kind": "service"}` would
+        # silently load as a tool.
+        if cap.declared_kind is not None and cap.declared_kind != cap.kind:
+            errors.append(
+                f"  capability {cap_id!r} declares kind {cap.declared_kind!r} "
+                f"but its id prefix says {cap.kind!r}"
+            )
+        if cap.version_argv is not None and (
+            not isinstance(cap.version_argv, list)
+            or not all(isinstance(tok, str) for tok in cap.version_argv)
+        ):
+            errors.append(
+                f"  capability {cap_id!r} 'version_argv' must be a list of strings"
+            )
+        if cap.min_version is not None and (
+            not isinstance(cap.min_version, str)
+            or _parse_semver(cap.min_version) is None
+        ):
+            errors.append(
+                f"  capability {cap_id!r} 'min_version' is not a semver-like "
+                f"string: {cap.min_version!r}"
+            )
+    for name, repo in config.repos.items():
+        for cap_id in repo.requires:
+            if cap_id not in config.capabilities:
+                errors.append(
+                    f"  repo {name!r} requires unknown capability {cap_id!r}"
+                )
+    if errors:
+        raise ValueError(
+            "invalid capability configuration:\n" + "\n".join(errors)
+        )
+
+
 def apply_cert_suite_policy(
     command: list[str], action: str, policy: dict,
 ) -> list[str]:
@@ -241,6 +355,34 @@ def apply_cert_suite_policy(
         f"cert_suite_policy[{action!r}].phase = {phase!r} "
         f"(expected 'stage' or 'release')"
     )
+
+
+@dataclass
+class CertEnv:
+    """Host-local resolution of capabilities (``cert-env.json``).
+
+    Supplies machine *facts* only — tool binary paths, service host/port,
+    credential env names, instance/lock ids. NEVER committed (it is
+    host/CI-specific and points at secrets by name). Keyed by capability id;
+    each value is the raw resolution dict for that capability, merged with the
+    committed behavior policy by ``build_capabilities_document``.
+    """
+    resolutions: dict[str, dict]   # capability id -> {bin|host|port|credential_env|...}
+
+    @staticmethod
+    def load(path: Path) -> Optional["CertEnv"]:
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"cert-env file {path} must be a JSON object mapping "
+                f"capability ids to host resolutions"
+            )
+        return CertEnv(resolutions={k: (v or {}) for k, v in raw.items()})
+
+    def get(self, cap_id: str) -> Optional[dict]:
+        return self.resolutions.get(cap_id)
 
 
 @dataclass
@@ -1137,6 +1279,217 @@ def write_empty_run_snapshot(run_id: str, out_path: Path) -> dict:
     return snapshot
 
 
+# ---------------------------------------------------------------------------
+# External capability provisioning
+#
+# Repos declare gate prerequisites that are neither package artifacts nor part
+# of any checkout (a schema-migration tool, a DB service, …) via per-repo
+# ``requires: ["tool:mariachi", "service:mariadb"]``. The platform contract is
+# a single resolved JSON document per run plus ONE env var pointing at it:
+#
+#   DRIFT_CERT_CAPABILITIES=<run-root>/capabilities.json
+#
+# Repos read that document and adapt it internally. The orchestrator injects no
+# per-tool env vars (no MARIACHI_BIN, no DB_HOST) — that brittle "wrapper around
+# today's env names" is exactly what this replaces. The committed
+# ``capabilities`` section carries behavior policy only; host facts come from
+# the host-local ``cert-env.json`` (see CertEnv); the per-run document is the
+# resolved merge.
+# ---------------------------------------------------------------------------
+
+CAPABILITIES_ENV_VAR = "DRIFT_CERT_CAPABILITIES"
+_CAPABILITIES_DOC_NAME = "capabilities.json"
+_CAPABILITIES_DOC_SCHEMA_VERSION = 1
+_SEMVER_TOKEN_RE = re.compile(r"\d+(?:\.\d+)*")
+
+
+def required_capability_ids(config: OrchestrationConfig, plan: "ExecutionPlan") -> list[str]:
+    """The set of capability ids required by the run's validated repos.
+
+    Union over ``requires`` of every repo that will actually run gates
+    (``plan.validated_repos``); dependency providers that are only staged do
+    not run gates, so their requirements (if any) do not apply. Sorted for a
+    deterministic document/preflight order.
+    """
+    ids: set[str] = set()
+    for repo_name in plan.validated_repos:
+        ids.update(config.repos[repo_name].requires)
+    return sorted(ids)
+
+
+def build_capabilities_document(
+    config: OrchestrationConfig,
+    plan: "ExecutionPlan",
+    cert_env: Optional[CertEnv],
+    run_id: str,
+) -> dict:
+    """Resolve required capabilities into the per-run document.
+
+    Merges committed behavior policy (``allocation`` for services) with the
+    host-local resolution facts (``bin`` / ``host`` / ``port`` /
+    ``credential_env`` / ``instance`` / ``lock_key``). Emits only the
+    *consumption* view — validation policy (``min_version`` / ``version_argv``)
+    is preflight-only and never written here.
+
+    Always returns a versioned document, even when nothing is required
+    (``"capabilities": {}``), so a consuming repo never special-cases a missing
+    file. Assumes the preflight has already passed, i.e. every required
+    capability resolves; missing facts surface as ``null`` rather than raising.
+    """
+    caps: dict[str, dict] = {}
+    for cap_id in required_capability_ids(config, plan):
+        cap = config.capabilities.get(cap_id)
+        res = (cert_env.get(cap_id) if cert_env else None) or {}
+        kind = cap.kind if cap else (cap_id.split(":", 1)[0] if ":" in cap_id else "")
+        if kind == "tool":
+            caps[cap_id] = {"kind": "tool", "bin": res.get("bin")}
+        elif kind == "service":
+            caps[cap_id] = {
+                "kind": "service",
+                "allocation": cap.allocation if cap else None,
+                "host": res.get("host"),
+                "port": res.get("port"),
+                "credential_env": res.get("credential_env"),
+                "instance": res.get("instance"),
+                "lock_key": res.get("lock_key"),
+            }
+        else:
+            caps[cap_id] = {"kind": kind, **res}
+    return {
+        "schema_version": _CAPABILITIES_DOC_SCHEMA_VERSION,
+        "run_id": run_id,
+        "capabilities": caps,
+    }
+
+
+def write_capabilities_document(document: dict, out_path: Path) -> None:
+    """Write the resolved capabilities document atomically."""
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(document, indent=2) + "\n")
+    tmp.replace(out_path)
+
+
+def _parse_semver(text: str) -> Optional[tuple[int, ...]]:
+    """Extract the first semver-like token (\\d+(.\\d+)*) and return its
+    integer tuple, or None if no token is present."""
+    m = _SEMVER_TOKEN_RE.search(text or "")
+    if not m:
+        return None
+    return tuple(int(p) for p in m.group(0).split("."))
+
+
+def _version_at_least(found: tuple[int, ...], minimum: tuple[int, ...]) -> bool:
+    """Numeric tuple compare with the shorter side zero-padded."""
+    width = max(len(found), len(minimum))
+    f = found + (0,) * (width - len(found))
+    m = minimum + (0,) * (width - len(minimum))
+    return f >= m
+
+
+def run_external_deps_preflight(
+    config: OrchestrationConfig,
+    plan: "ExecutionPlan",
+    cert_env: Optional[CertEnv],
+) -> Optional[str]:
+    """Validate every external capability the run's gates require.
+
+    Runs after checkouts and BEFORE staging, so a missing tool/service blocks
+    the run in seconds rather than failing deep inside a gate after minutes of
+    staging. For each required id: the host must resolve it (``cert-env.json``);
+    a tool's ``bin`` must exist and be executable (+ ``min_version`` when
+    declared); a service's ``credential_env`` must be set & non-empty and its
+    ``host:port`` must accept a TCP connection.
+
+    Validates exactly the endpoint/binary that will be written into the
+    per-run document and consumed by the gates. Returns a human-readable block
+    reason, or ``None`` if all required capabilities are satisfied (including
+    the trivial "nothing required" case).
+    """
+    required = required_capability_ids(config, plan)
+    if not required:
+        return None
+
+    print("  preflight: external capabilities ...", flush=True)
+    failures: list[str] = []
+    for cap_id in required:
+        cap = config.capabilities[cap_id]
+        res = cert_env.get(cap_id) if cert_env else None
+        if res is None:
+            print(f"    {cap_id:28s} NOT PROVIDED")
+            failures.append(
+                f"capability {cap_id!r} is required but not provided on this "
+                f"host; add it to your cert-env file (--cert-env / "
+                f"DRIFT_CERT_ENV / ./cert-env.json)"
+            )
+            continue
+        if cap.kind == "tool":
+            err = _preflight_tool(cap, res)
+        elif cap.kind == "service":
+            err = _preflight_service(cap, res)
+        else:
+            err = f"unknown capability kind {cap.kind!r}"
+        if err:
+            print(f"    {cap_id:28s} FAILED")
+            failures.append(f"{cap_id}: {err}")
+        else:
+            print(f"    {cap_id:28s} ok")
+
+    if failures:
+        return "external capability check failed:\n    - " + "\n    - ".join(failures)
+    return None
+
+
+def _preflight_tool(cap: Capability, res: dict) -> Optional[str]:
+    """Validate a tool capability: bin present/executable + optional version."""
+    bin_path = res.get("bin")
+    if not bin_path:
+        return "host resolution has no 'bin'"
+    p = Path(bin_path)
+    if not p.is_file() or not os.access(bin_path, os.X_OK):
+        return f"binary not found or not executable: {bin_path}"
+    if cap.min_version:
+        argv = [bin_path if tok == "{bin}" else tok
+                for tok in (cap.version_argv or ["{bin}", "--version"])]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return f"version probe failed: {exc}"
+        if proc.returncode != 0:
+            # A probe that errors out but happens to print a version string
+            # must not pass — the command failing is itself a block.
+            return (f"version probe `{' '.join(argv)}` exited "
+                    f"{proc.returncode}")
+        found = _parse_semver((proc.stdout or "") + "\n" + (proc.stderr or ""))
+        if found is None:
+            return (f"could not determine version (no semver token in "
+                    f"`{' '.join(argv)}` output)")
+        # min_version is load-validated to be parseable, so this is non-None.
+        minimum = _parse_semver(cap.min_version) or ()
+        if not _version_at_least(found, minimum):
+            got = ".".join(str(n) for n in found)
+            return f"version {got} is below required min_version {cap.min_version}"
+    return None
+
+
+def _preflight_service(cap: Capability, res: dict) -> Optional[str]:
+    """Validate a service capability: secret present + TCP reachability."""
+    cred_env = res.get("credential_env")
+    if not cred_env:
+        return "host resolution has no 'credential_env'"
+    if not os.environ.get(cred_env):
+        return f"credential env {cred_env!r} is not set (or empty) in the environment"
+    host = res.get("host")
+    port = res.get("port")
+    if not host or not port:
+        return "host resolution missing 'host'/'port'"
+    try:
+        with socket.create_connection((host, int(port)), timeout=5):
+            pass
+    except OSError as exc:
+        return f"{host}:{port} unreachable ({exc})"
+    return None
+
+
 def build_run_snapshot(
     libs_root: Path, run_id: str, out_path: Path,
 ) -> dict:
@@ -1583,6 +1936,15 @@ def build_step_env(
         env["DRIFT_RUN_SNAPSHOT"] = str(
             (ctx.run_root / "run-snapshot.json").resolve()
         )
+        # External capability contract: point gates at the single resolved
+        # document. The orchestrator adds ONLY this var — no per-tool env
+        # vars. The document always exists (written at run start, possibly
+        # empty), so consumers never special-case a missing file. Secrets
+        # named by a capability's `credential_env` are inherited from
+        # os.environ above, never added or renamed here.
+        env[CAPABILITIES_ENV_VAR] = str(
+            (ctx.run_root / _CAPABILITIES_DOC_NAME).resolve()
+        )
     elif action == "stage_packages":
         env["DRIFT_CERT_MODE"] = "stage"
         env["DRIFT_RUN_SNAPSHOT"] = str(
@@ -1781,7 +2143,9 @@ def run_author_claim_preflight(
 
 
 def execute_run(
-    config: OrchestrationConfig, plan: ExecutionPlan
+    config: OrchestrationConfig,
+    plan: ExecutionPlan,
+    cert_env: Optional[CertEnv] = None,
 ) -> dict:
     """Execute the full certification run. Returns the summary dict."""
     started_at = datetime.now(timezone.utc)
@@ -1815,6 +2179,27 @@ def execute_run(
             )
             _write_run_outputs(ctx, summary)
             return summary
+    print()
+
+    # External capability preflight: validate every tool/service the run's
+    # gates require BEFORE staging, so a missing dependency blocks in seconds
+    # instead of failing deep inside a gate after minutes of staging. On pass,
+    # write the resolved per-run capabilities document (always written, even
+    # when empty) and inject it via DRIFT_CERT_CAPABILITIES at gate time.
+    block_reason = run_external_deps_preflight(config, plan, cert_env)
+    if block_reason:
+        print(f"    {block_reason}", file=sys.stderr)
+        summary = _build_summary(
+            ctx, config, plan, started_at, "blocked",
+            steps_results=[], block_reason=block_reason,
+            fasttrack=plan.fasttrack,
+        )
+        _write_run_outputs(ctx, summary)
+        return summary
+    write_capabilities_document(
+        build_capabilities_document(config, plan, cert_env, ctx.run_id),
+        ctx.run_root / _CAPABILITIES_DOC_NAME,
+    )
     print()
 
     # Seed an empty run snapshot before any step runs. Both stage and
@@ -2533,6 +2918,13 @@ def main() -> None:
         default="orchestration.json",
         help="Path to orchestration.json",
     )
+    parser.add_argument(
+        "--cert-env",
+        default=None,
+        help="Path to the host-local cert-env.json (external capability "
+             "resolution). Default lookup: --cert-env, then $DRIFT_CERT_ENV, "
+             "then ./cert-env.json. Host-specific; never committed.",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -2609,8 +3001,35 @@ def main() -> None:
             else:
                 print_plan(plan, config)
         else:
-            summary = execute_run(config, plan)
+            cert_env = _resolve_cert_env(args.cert_env)
+            summary = execute_run(config, plan, cert_env=cert_env)
             sys.exit(0 if summary["verdict"] == "certified" else 1)
+
+
+def _resolve_cert_env(cli_path: Optional[str]) -> Optional[CertEnv]:
+    """Resolve and load the host-local cert-env file.
+
+    Lookup order: ``--cert-env`` → ``$DRIFT_CERT_ENV`` → ``./cert-env.json``.
+    An explicitly named path that does not exist is an error (the operator
+    asked for it); the implicit default is optional — a run that needs no
+    capability runs fine without one, and one that does is blocked clearly by
+    the preflight.
+    """
+    explicit = cli_path or os.environ.get("DRIFT_CERT_ENV")
+    if explicit:
+        path = Path(explicit)
+        if not path.exists():
+            print(f"error: cert-env file not found: {path}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        path = Path("cert-env.json")
+        if not path.exists():
+            return None
+    try:
+        return CertEnv.load(path)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _load_and_plan(

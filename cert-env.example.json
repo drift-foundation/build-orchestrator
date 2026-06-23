@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Host-local external-capability resolution. COPY to cert-env.json (gitignored)",
+    "and edit for this machine. Supplies machine FACTS only — never behavior policy",
+    "(that lives in orchestration.json:capabilities) and never secret VALUES (only the",
+    "name of the env var that holds the secret, via credential_env).",
+    "Lookup order: --cert-env <path>, then $DRIFT_CERT_ENV, then ./cert-env.json."
+  ],
+
+  "tool:mariachi": {
+    "bin": "/opt/drift/cert-tools/mariachi/.venv/bin/mariachi"
+  },
+
+  "service:mariadb": {
+    "host": "127.0.0.1",
+    "port": 34114,
+    "credential_env": "MDB_ROOT_PWD",
+    "instance": "mdb114-a",
+    "lock_key": "mariadb-mdb114-a"
+  }
+}

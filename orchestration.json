@@ -52,12 +52,24 @@
       "path": "../drift-workflows",
       "kind": "package_repo",
       "depends_on": ["drift-lang", "drift-mariadb-client", "drift-web"],
+      "requires": ["tool:mariachi", "service:mariadb"],
       "commands": {
         "test": ["just", "test"],
         "stress": ["just", "stress"],
         "perf": ["just", "perf"],
         "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
       }
+    }
+  },
+  "capabilities": {
+    "tool:mariachi": {
+      "kind": "tool",
+      "min_version": "1.0.0",
+      "version_argv": ["{bin}", "--version"]
+    },
+    "service:mariadb": {
+      "kind": "service",
+      "allocation": "shared-exclusive"
     }
   },
   "environment": {
