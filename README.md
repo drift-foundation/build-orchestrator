@@ -23,15 +23,19 @@ full stack passes.
 
 ## Current Workspace
 
-The default orchestration config covers:
+The default workspace is defined in `orchestration.json`. It lists the repos,
+the dependency graph, and the command contract used by `plan` and `certify` —
+that config is the single source of truth, not this README.
 
-- `../drift-lang`
-- `../drift-mariadb-client`
-- `../drift-net-tls`
-- `../drift-web`
+`drift-lang` is treated as the toolchain source for certification runs. It is
+staged for downstream use but is not itself a validation target.
 
-`drift-lang` is treated as the toolchain source for certification runs. It
-is staged for downstream use but is not itself a validation target.
+To see the repos involved and validated for a given set of candidate commits,
+run a plan, e.g.:
+
+```
+./orchestrate.py plan run-all-latest.json
+```
 
 ## Inputs And Outputs
 

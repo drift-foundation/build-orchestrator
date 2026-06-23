@@ -10,11 +10,6 @@
       "path": "../drift-lang",
       "kind": "toolchain",
       "depends_on": [],
-      "affects": [
-        "drift-mariadb-client",
-        "drift-net-tls",
-        "drift-web"
-      ],
       "commands": {
         "setup_venv": ["bash", "-c", "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/pip install pex"],
         "stage_toolchain": ["just", "deploy", "--dest", "{toolchain_root}"]
@@ -24,7 +19,6 @@
       "path": "../drift-mariadb-client",
       "kind": "package_repo",
       "depends_on": ["drift-lang"],
-      "affects": [],
       "commands": {
         "test": ["just", "test"],
         "stress": ["just", "stress"],
@@ -36,7 +30,6 @@
       "path": "../drift-net-tls",
       "kind": "package_repo",
       "depends_on": ["drift-lang"],
-      "affects": ["drift-web"],
       "commands": {
         "test": ["just", "test"],
         "stress": ["just", "stress"],
@@ -48,7 +41,17 @@
       "path": "../drift-web",
       "kind": "package_repo",
       "depends_on": ["drift-lang", "drift-net-tls"],
-      "affects": [],
+      "commands": {
+        "test": ["just", "test"],
+        "stress": ["just", "stress"],
+        "perf": ["just", "perf"],
+        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
+      }
+    },
+    "drift-workflows": {
+      "path": "../drift-workflows",
+      "kind": "package_repo",
+      "depends_on": ["drift-lang", "drift-mariadb-client", "drift-web"],
       "commands": {
         "test": ["just", "test"],
         "stress": ["just", "stress"],

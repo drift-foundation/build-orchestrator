@@ -2,5 +2,6 @@
   "drift-lang": "1da2489f77b77e436c7a783289c8adc8ea050183",
   "drift-mariadb-client": "b0dec0ff615c217597979bab0175df69044173fa",
   "drift-net-tls": "a3953c3347ddb69d7f9dd46f34fc4e6385998e40",
-  "drift-web": "dd1df9ea6599f86bc44185dc7540e5c3024b6736"
+  "drift-web": "dd1df9ea6599f86bc44185dc7540e5c3024b6736",
+  "drift-workflows": "63ac864b5f836be9d67823414da4b0c7624d0780"
 }

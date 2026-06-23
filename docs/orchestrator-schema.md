@@ -41,11 +41,6 @@ Suggested shape:
       "path": "../drift-lang",
       "kind": "toolchain",
       "depends_on": [],
-      "affects": [
-        "drift-mariadb-client",
-        "drift-net-tls",
-        "drift-web"
-      ],
       "commands": {
         "stage_toolchain": ["drift", "deploy", "--dest", "{toolchain_root}"]
       }
@@ -54,7 +49,6 @@ Suggested shape:
       "path": "../drift-mariadb-client",
       "kind": "package_repo",
       "depends_on": ["drift-lang"],
-      "affects": [],
       "commands": {
         "test": ["just", "test"],
         "stage_packages": ["drift", "deploy", "--dest", "{libs_root}"]
@@ -64,7 +58,6 @@ Suggested shape:
       "path": "../drift-net-tls",
       "kind": "package_repo",
       "depends_on": ["drift-lang"],
-      "affects": ["drift-web"],
       "commands": {
         "test": ["just", "test"],
         "stage_packages": ["drift", "deploy", "--dest", "{libs_root}"]
@@ -74,7 +67,6 @@ Suggested shape:
       "path": "../drift-web",
       "kind": "package_repo",
       "depends_on": ["drift-lang", "drift-net-tls"],
-      "affects": [],
       "commands": {
         "test": ["just", "test"],
         "stage_packages": ["drift", "deploy", "--dest", "{libs_root}"]
@@ -102,6 +94,9 @@ Suggested shape:
 
 Notes:
 
+- `depends_on` is the single source of truth for the dependency graph: a repo declares only its direct providers
+- there is no `affects` field — the orchestrator walks `depends_on` upstream for provider staging (transitive closure) and reverses it for downstream invalidation, so adding a consumer never requires editing an upstream provider's config (a stale `affects` key is rejected at load)
+- every `depends_on` entry must name a configured repo; an unknown provider is a load-time error
 - commands are argv arrays, not shell strings
 - placeholder substitution should be done by the Python driver
 - repo-specific env can be added later if needed

@@ -56,7 +56,6 @@ class RepoConfig:
     path: str
     kind: str
     depends_on: list[str]
-    affects: list[str]
     commands: dict[str, list[str]]
 
 
@@ -109,14 +108,27 @@ class OrchestrationConfig:
     def load(path: Path) -> "OrchestrationConfig":
         raw = json.loads(path.read_text())
         repos = {}
+        stale_affects = []
         for name, r in raw["repos"].items():
+            # `affects` was removed from the config model: depends_on is the
+            # single source of truth and the downstream-invalidation graph is
+            # derived by reversing it (see build_forward_graph). A lingering
+            # `affects` key is now meaningless — reject it loudly rather than
+            # silently ignore a stale edge.
+            if "affects" in r:
+                stale_affects.append(name)
             repos[name] = RepoConfig(
                 name=name,
                 path=r["path"],
                 kind=r["kind"],
                 depends_on=r.get("depends_on", []),
-                affects=r.get("affects", []),
                 commands=r.get("commands", {}),
+            )
+        if stale_affects:
+            raise ValueError(
+                "`affects` is no longer part of the config model; downstream "
+                "invalidation is derived from reversed depends_on. Remove "
+                "`affects` from: " + ", ".join(sorted(stale_affects))
             )
         # Derive config_name from the filename, stripping .json.
         config_name = path.stem
@@ -132,6 +144,7 @@ class OrchestrationConfig:
             config_name=config_name,
         )
         _validate_repo_recipes(config)
+        _validate_dependency_graph(config)
         return config
 
     @property
@@ -163,6 +176,34 @@ def _validate_repo_recipes(config: OrchestrationConfig) -> None:
                         f"Move it to orchestration.json:cert_suite_policy "
                         f"and remove the flag from the recipe."
                     )
+
+
+def _validate_dependency_graph(config: OrchestrationConfig) -> None:
+    """Reject ``depends_on`` edges that point at an unconfigured repo.
+
+    A ``depends_on`` edge is a provider edge in the *staging* graph: if A
+    declares ``A -> B`` the orchestrator must stage B (and B's closure)
+    before certifying A. If B is not a configured repo the orchestrator
+    cannot stage it, so this is a hard config error — not a silent omission
+    that would later surface as a missing-package build failure deep in a
+    gate run.
+
+    Every edge is checked here, so the derived downstream-invalidation graph
+    (``build_forward_graph``, the reverse of ``depends_on``) is likewise
+    guaranteed to reference only configured repos.
+    """
+    errors: list[str] = []
+    for name, repo in config.repos.items():
+        for dep in repo.depends_on:
+            if dep not in config.repos:
+                errors.append(
+                    f"  repo {name!r} depends_on unknown repo {dep!r}"
+                )
+    if errors:
+        raise ValueError(
+            "invalid depends_on edges — every provider must be a configured "
+            "repo:\n" + "\n".join(errors)
+        )
 
 
 def apply_cert_suite_policy(
@@ -238,13 +279,27 @@ class ExecutionPlan:
 # ---------------------------------------------------------------------------
 
 def build_forward_graph(config: OrchestrationConfig) -> dict[str, list[str]]:
-    """Build adjacency list: repo -> list of repos it affects."""
-    graph: dict[str, list[str]] = {name: [] for name in config.repos}
+    """Build the downstream-invalidation graph: repo -> repos to re-validate
+    when it changes.
+
+    ``depends_on`` is the single source of truth. The downstream graph is
+    simply its reverse: if consumer X declares ``depends_on`` Y, then a change
+    to provider Y must re-validate X, i.e. ``Y -> X`` is a downstream edge.
+
+    Deriving it means a package author declares only its own direct providers
+    and never has to track who depends on it. Adding a new consumer touches
+    only that consumer's config; upstream provider configs stay untouched and
+    can never go stale — which is what an explicit, hand-maintained reverse
+    edge list inevitably does at scale.
+    """
+    graph: dict[str, set[str]] = {name: set() for name in config.repos}
+    # Reverse of depends_on (provider -> consumer). Deps are guaranteed
+    # configured by _validate_dependency_graph; guard regardless.
     for name, repo in config.repos.items():
-        for target in repo.affects:
-            if target in config.repos:
-                graph[name].append(target)
-    return graph
+        for dep in repo.depends_on:
+            if dep in config.repos:
+                graph[dep].add(name)
+    return {name: sorted(targets) for name, targets in graph.items()}
 
 
 def compute_affected(
@@ -262,6 +317,40 @@ def compute_affected(
             if downstream not in visited:
                 queue.append(downstream)
     return list(visited)
+
+
+def compute_provider_closure(
+    config: OrchestrationConfig, seeds: list[str]
+) -> set[str]:
+    """Expand *seeds* to their full transitive ``depends_on`` closure.
+
+    Package semantics: if A declares ``A -> B`` and B depends on XYZ, then
+    certifying A must stage B *and* B's entire provider closure — A never has
+    to know or declare XYZ. This walks ``depends_on`` edges to a fixpoint so
+    the plan/staging set includes every transitive provider, not just the
+    immediate ones.
+
+    This walks ``depends_on`` in the upstream direction (consumer -> provider).
+    The downstream-invalidation graph (``build_forward_graph``) walks the
+    *reverse* of the same edges: that one answers "who must be re-validated
+    when X changes"; this closure answers "what must be staged so an involved
+    repo can build". Both are derived from the single ``depends_on`` graph.
+
+    Every ``depends_on`` edge is guaranteed to reference a configured repo by
+    ``_validate_dependency_graph`` at config load, so an unconfigured provider
+    fails loudly there rather than being silently dropped here.
+    """
+    closure: set[str] = set()
+    queue = deque(seeds)
+    while queue:
+        repo = queue.popleft()
+        if repo in closure:
+            continue
+        closure.add(repo)
+        for dep in config.repos[repo].depends_on:
+            if dep not in closure:
+                queue.append(dep)
+    return closure
 
 
 def topo_sort(
@@ -402,11 +491,12 @@ def compute_plan(
     affected = compute_affected(forward_graph, changed)
 
     # Pull in dependency providers needed by affected repos (e.g. drift-lang
-    # as toolchain input even when it didn't change).
-    involved_set = set(affected)
-    for repo_name in list(affected):
-        for dep in config.repos[repo_name].depends_on:
-            involved_set.add(dep)
+    # as toolchain input even when it didn't change). This must be the *full
+    # transitive* provider closure, not just immediate providers: if affected
+    # repo A depends on B and B depends on XYZ, A's staging set needs XYZ too,
+    # even though A never declares it. Downstream invalidation is the reverse
+    # walk of the same depends_on graph, computed above as `affected`.
+    involved_set = compute_provider_closure(config, list(affected))
 
     # Involved repos: all affected + their providers, topologically sorted.
     involved = topo_sort(list(involved_set), config)
@@ -2502,7 +2592,11 @@ def main() -> None:
         print(f"error: config not found: {config_path}", file=sys.stderr)
         sys.exit(1)
 
-    config = OrchestrationConfig.load(config_path)
+    try:
+        config = OrchestrationConfig.load(config_path)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if args.command in ("plan", "certify"):
         plan = _load_and_plan(config, args.input_file, fasttrack=args.fasttrack)

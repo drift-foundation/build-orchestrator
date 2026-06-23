@@ -198,13 +198,13 @@ Example conceptual config:
 workspace_root: ..
 
 repos:
+  # depends_on is the only edge list authors maintain. The orchestrator
+  # reverses it to derive downstream invalidation (e.g. a drift-lang change
+  # re-validates every repo that declares depends_on: drift-lang), so providers
+  # never enumerate their consumers.
   drift-lang:
     path: ../drift-lang
     kind: toolchain
-    affects:
-      - drift-mariadb-client
-      - drift-net-tls
-      - drift-web
     commands:
       stage_toolchain: drift deploy --dest {toolchain_root}
 
