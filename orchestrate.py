@@ -65,16 +65,22 @@ class RepoConfig:
 class Capability:
     """A declared external capability (cert tool or service).
 
-    The committed ``capabilities`` section declares *behavior policy* only —
-    never host facts. Machine facts (paths, host/port, credential env names,
-    instance/lock ids) come from the host-local ``cert-env.json`` (see
-    ``CertEnv``); the per-run ``capabilities.json`` document is the resolved
-    merge that repos read via ``DRIFT_CERT_CAPABILITIES``.
+    The committed ``capabilities`` section declares *policy* only — never host
+    facts. Machine facts (paths, host/port, credential env names, instance id)
+    come from the host-local ``cert-env.json`` (see ``CertEnv``); the per-run
+    ``capabilities.json`` document is the resolved merge that repos read via
+    ``DRIFT_CERT_CAPABILITIES``.
+
+    A ``service`` capability is just a shared instance the project connects to;
+    the orchestrator models no schemas, locks, or concurrency. Each project
+    owns its own sandbox schema(s) against that instance (created/dropped via
+    its schema tool, e.g. Mariachi) and may create as many as it needs —
+    isolation between projects is by separate schema, so the orchestrator does
+    not serialize a shared service across projects.
 
     Fields:
       - ``id``           : the capability id, e.g. ``"tool:mariachi"``.
       - ``kind``         : ``"tool"`` or ``"service"`` (derived from the id prefix).
-      - ``allocation``   : service behavior class, e.g. ``"shared-exclusive"``.
       - ``min_version``  : optional tool minimum (preflight-only, not emitted).
       - ``version_argv`` : optional tool version probe argv (``{bin}`` resolved
                            host-locally; preflight-only, not emitted).
@@ -82,7 +88,6 @@ class Capability:
     id: str
     kind: str                          # authoritative, derived from the id prefix
     declared_kind: Optional[str] = None  # explicit body `kind`, validated to match
-    allocation: Optional[str] = None
     min_version: Optional[str] = None
     version_argv: Optional[list[str]] = None
 
@@ -258,7 +263,6 @@ def _parse_capabilities(raw: dict) -> dict[str, "Capability"]:
             id=cap_id,
             kind=kind,
             declared_kind=body.get("kind"),
-            allocation=body.get("allocation"),
             min_version=body.get("min_version"),
             version_argv=body.get("version_argv"),
         )
@@ -1325,11 +1329,14 @@ def build_capabilities_document(
 ) -> dict:
     """Resolve required capabilities into the per-run document.
 
-    Merges committed behavior policy (``allocation`` for services) with the
-    host-local resolution facts (``bin`` / ``host`` / ``port`` /
-    ``credential_env`` / ``instance`` / ``lock_key``). Emits only the
-    *consumption* view — validation policy (``min_version`` / ``version_argv``)
-    is preflight-only and never written here.
+    Merges the committed capability (kind) with the host-local resolution facts
+    (``bin`` for tools; required ``host`` / ``port`` / ``credential_env`` plus an
+    optional ``instance`` label for services — omitted when absent, never null).
+    Emits only the *consumption* view — validation policy
+    (``min_version`` / ``version_argv``) is preflight-only and never written
+    here. A service is just a shared instance to connect to; the document
+    carries no locks/concurrency/schemas — schema lifecycle is the project's own
+    concern (managed via its schema tool, e.g. Mariachi).
 
     Always returns a versioned document, even when nothing is required
     (``"capabilities": {}``), so a consuming repo never special-cases a missing
@@ -1344,15 +1351,18 @@ def build_capabilities_document(
         if kind == "tool":
             caps[cap_id] = {"kind": "tool", "bin": res.get("bin")}
         elif kind == "service":
-            caps[cap_id] = {
+            entry = {
                 "kind": "service",
-                "allocation": cap.allocation if cap else None,
                 "host": res.get("host"),
                 "port": res.get("port"),
                 "credential_env": res.get("credential_env"),
-                "instance": res.get("instance"),
-                "lock_key": res.get("lock_key"),
             }
+            # `instance` is an optional human-facing label, not a connection
+            # requirement — omit the key entirely when the host didn't provide
+            # one rather than emit a null.
+            if res.get("instance") is not None:
+                entry["instance"] = res["instance"]
+            caps[cap_id] = entry
         else:
             caps[cap_id] = {"kind": kind, **res}
     return {

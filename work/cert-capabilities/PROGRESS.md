@@ -3,7 +3,20 @@
 Tracks where we stand against `PLAN.md`. Update statuses as work lands.
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
-_Last updated: 2026-06-23 — IMPLEMENTED (orchestrator side). Steps 0–8 done and verified offline; not yet committed. Pending: real-host end-to-end + workflows-team adoption of the reader._
+_Last updated: 2026-06-23 — IMPLEMENTED + committed (b7ef786). Post-commit revision: `service` simplified to connection-facts-only (removed `allocation`/`concurrency`/`lock_key`). Pending: real-host end-to-end + workflows reader adoption._
+
+## Service-contract revision (post-review)
+
+`service:*` carries **connection facts only** — `host`/`port`/`credential_env`/
+`instance`. Removed `allocation`/`concurrency`/`lock_key` from the model, config,
+docs, and the run document. Rationale: each project owns its own sandbox
+schema(s) on the shared instance (via Mariachi), unlimited count; projects are
+isolated by schema, so the orchestrator does not serialize the instance or model
+locks/concurrency. DB locking is the project's own gate concern, schema-scoped.
+Touched: `orchestrate.py` (`Capability`, `_parse_capabilities`,
+`build_capabilities_document`), `orchestration.json`, `cert-env.example.json`,
+both docs, and `WORKFLOWS_ADOPTION.md`. Verified offline. **Uncommitted** (this
+revision is on top of the committed feature).
 
 ## Second-review resolutions (folded into PLAN)
 
@@ -57,6 +70,50 @@ _Last updated: 2026-06-23 — IMPLEMENTED (orchestrator side). Steps 0–8 done 
   - [x] Secret named by `credential_env` is inherited by the gate process (`build_step_env` starts from
         `dict(os.environ)`); orchestrator adds only `DRIFT_CERT_CAPABILITIES`. Preflight checks presence.
   - [ ] (Optional, future) toolchain-side accessor (`drift cert cap get …`). Not required for v1.
+
+## Capability-surface decision: private DB → `tool:docker` (post-review)
+
+drift-workflows moved MariaDB from a consumed `service:mariadb` to a repo-private
+Docker container (it owns the lifecycle). Per the consume-vs-own rule, that means
+declaring the actual external prerequisite — the container runtime — not hiding
+it. Orch-side changes (this revision, uncommitted):
+- `orchestration.json`: drift-workflows `requires` → `["tool:mariachi","tool:docker"]`;
+  capabilities: **dropped `service:mariadb`**, **added `tool:docker`** (presence-only).
+- `cert-env.example.json`: dropped the `service:mariadb` resolution, added
+  `tool:docker` → `/usr/bin/docker`. (Cert host's real `cert-env.json` must provide it.)
+- Docs: onboarding §5 now recommends the Docker-image pattern + declaring
+  `tool:docker`; new **"Gates restore entry state"** rule (§1 + §5) — a gate that
+  starts a container must tear it down (success or failure); leftover state is a defect.
+Verified: preflight blocks early when `tool:docker` is unresolved; document emits
+both tools; `service:mariadb` gone. Known limit: tool preflight checks the docker
+*client* binary, not daemon liveness (provisioner covers the daemon).
+
+Workflows side (all verified done): `tool:docker` declared; image digest-pinned
+(`mariadb@sha256:…`); `db_instance.sh` uses `$DOCKER_BIN` + checks daemon
+liveness; root `test`/`stress`/`perf` trap-`down` only if they `STARTED` the
+container (sub-gates `up`-only, no trap → nesting-safe); `clean-data` rewired via
+a new `db_instance.sh sql` (`docker exec`); lock key renamed off `mdb114-a`.
+
+**Decision (accepted):** the cert host **may pull the pinned image digest at gate
+time** — no image-presence preflight is required. Implication: gate-time registry
+egress must be allowed on the cert host; first run (or post-GC) pays a one-time
+pull. The `tool:docker` preflight covers the client only; daemon + image are the
+gate's concern.
+
+Remaining to a green cert (provisioning, not code): cert-host `cert-env.json`
+provides `tool:mariachi.bin` + `tool:docker.bin`; the pinned image is reachable;
+committed **perf baseline for the cert host's machine-id**.
+
+## Doc clarification (post-review): consume vs. own a service
+
+Added to both `orchestrator-schema.md` and `certification-onboarding.md`:
+`service:*` means **the platform provisions an endpoint the repo consumes** —
+declare it only for a platform-provided instance a gate connects to. A gate that
+**owns** its DB lifecycle (private container/process) is a repo-private fixture,
+not a service capability — declare nothing (e.g. `drift-mariadb-client` owns its
+instance and does not advertise `service:mariadb`). A private fixture's own
+external prerequisite is modeled separately (e.g. `tool:docker`), not
+`service:mariadb`. Uncommitted, with the service-simplification revision.
 
 ## Steps
 

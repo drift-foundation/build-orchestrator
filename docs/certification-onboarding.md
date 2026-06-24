@@ -42,6 +42,12 @@ progress, don't run long-silent.
 `--cert-suite-evidence-sha256`, or `--cert-suite-no-evidence` in any recipe;
 config load rejects them. The orchestrator injects cert-suite policy itself.
 
+**Gates restore entry state.** A gate must leave the host as it found it —
+idempotent and self-cleaning. Anything it starts (a container, daemon, process)
+or allocates (a port, a temp dir) it must tear down on exit, success or failure;
+anything that was already present, it leaves untouched. Leftover state that a
+later run inherits is a defect (see §5 for the DB-fixture case).
+
 ---
 
 ## 2. Dependencies — `depends_on` (direct providers only)
@@ -103,6 +109,46 @@ capability in your repo entry:
   and resolved on the cert host (`cert-env.json`); if it isn't, your run is
   **blocked** with a clear reason before staging (see §7).
 
+**Declare a `service:*` only for a platform-provided endpoint you *consume*.**
+A `service:*` capability means *the platform owns and provisions the endpoint,
+and your gate connects to it* — typically because your gate coordinates with
+other products or shared schemas on the same instance. It does **not** mean "my
+tests use a database."
+
+- **Consume (declare it):** your gate connects to a shared instance the platform
+  stands up. Declare `service:mariadb`; the orchestrator provides the connection
+  facts and blocks the run if the endpoint isn't reachable.
+- **Own (do not declare `service:*`):** your gate starts and manages its *own*
+  MariaDB — a private instance whose lifecycle you control inside the gate. That
+  is a **repo-private test fixture**, not a shared service. Do **not** declare
+  `service:mariadb`. (Example: `drift-mariadb-client` exercises MariaDB but owns
+  the instance lifecycle itself, so it does not advertise `service:mariadb`.)
+  - **Recommended pattern:** spin the instance up from a **Docker image** on a
+    private port. It's the most portable way to get a MariaDB at a custom port
+    with no interference from other repos' gates. When you do this you depend on
+    a container runtime, so **declare `requires: [..., "tool:docker"]`** — that
+    makes the preflight verify Docker on the cert host and block early if it's
+    missing, instead of failing deep inside your first schema setup. (Pin the
+    image by digest, or have the platform pre-provision it, so the gate doesn't
+    pull over the network at run time.) The point still stands: declare what the
+    *platform* must provide (the container runtime), not the database itself.
+- **Restore entry state (required).** A gate must leave the host exactly as it
+  found it. If your gate **starts** the private container, it must **stop and
+  remove it** on exit (success or failure); if the instance was already running
+  when the gate began (e.g. a dev box), leave it as-is. A container, process,
+  port, or schema left behind after the gate is a defect — concurrent and
+  subsequent runs must not inherit your leftover state.
+
+**A consumed `service` is a shared instance — you own your schema(s).** When you
+do consume one, the orchestrator hands you connection facts (host/port/
+credential) for a reused instance; it models no schemas, locks, or concurrency.
+You create/drop/control your own **sandbox schema(s)** against it (via your
+schema tool, e.g. Mariachi), as many as you need. Different projects are isolated
+by separate schemas, so the platform does not serialize the instance across
+projects. If *your own* gates need to serialize concurrent runs against *your*
+schema, that's your gate's concern — key your lock to your schema, not to the
+shared instance (an instance-wide lock needlessly blocks unrelated projects).
+
 ---
 
 ## 6. The `DRIFT_CERT_CAPABILITIES` contract
@@ -128,17 +174,18 @@ authoritative schema):
   "run_id": "<run-id>",
   "capabilities": {
     "tool:mariachi":   { "kind": "tool", "bin": "/host/path/.venv/bin/mariachi" },
-    "service:mariadb": { "kind": "service", "allocation": "shared-exclusive",
+    "service:mariadb": { "kind": "service",
                          "host": "127.0.0.1", "port": 34114,
-                         "credential_env": "MDB_ROOT_PWD",
-                         "instance": "mdb114-a", "lock_key": "mariadb-mdb114-a" }
+                         "credential_env": "MDB_ROOT_PWD", "instance": "mdb114-a" }
   }
 }
 ```
 
 `credential_env` is the **name** of the env var holding the secret — the value
 is never in the file. The orchestrator guarantees that env var is present in
-the gate environment; you read it by name.
+the gate environment; you read it by name. For a service, `host`/`port`/
+`credential_env` are always present; `instance` is an optional label and may be
+absent (the key is omitted, never `null`) — don't depend on it.
 
 ### Bash (jq)
 
@@ -169,7 +216,6 @@ db = {
     "host": svc["host"],
     "port": int(svc["port"]),
     "password": os.environ[svc["credential_env"]],  # value read by name
-    "lock_key": svc["lock_key"],
 }
 ```
 

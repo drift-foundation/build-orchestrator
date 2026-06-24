@@ -1,5 +1,17 @@
 # External Capability Provisioning for Certification Gates
 
+> **Revision (2026-06-23, post-implementation):** the `service` contract was
+> simplified after review. A `service:*` capability now carries **connection
+> facts only** — `host`/`port`/`credential_env`/`instance`. The earlier
+> `allocation` / `concurrency` / `lock_key` fields were **removed**: each project
+> owns its own sandbox schema(s) on the shared instance (via Mariachi) and may
+> create as many as it needs, so projects are isolated by schema and the
+> orchestrator neither models schemas nor serializes the instance across
+> projects. Any DB locking is the project's own gate concern, keyed to its
+> schema (not the instance). The schema blocks below that still show
+> `allocation`/`lock_key` are historical; the authoritative shapes are in
+> `docs/orchestrator-schema.md`, `cert-env.example.json`, and `orchestrate.py`.
+
 ## Context
 
 `drift-workflows` joined the certification pool. Its first real cert run

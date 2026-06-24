@@ -11,11 +11,7 @@
     "bin": "/opt/drift/cert-tools/mariachi/.venv/bin/mariachi"
   },
 
-  "service:mariadb": {
-    "host": "127.0.0.1",
-    "port": 34114,
-    "credential_env": "MDB_ROOT_PWD",
-    "instance": "mdb114-a",
-    "lock_key": "mariadb-mdb114-a"
+  "tool:docker": {
+    "bin": "/usr/bin/docker"
   }
 }

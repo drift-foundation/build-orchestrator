@@ -166,13 +166,13 @@ Three layers, three owners:
 **Capability ids** are `tool:<name>` or `service:<name>`. A repo's `requires`
 is a list of ids; an id that names no declared capability is a load-time error.
 
-**Committed `capabilities`** carries *behavior policy only* — never host facts:
+**Committed `capabilities`** carries *policy only* — never host facts:
 
 ```json
 "capabilities": {
   "tool:mariachi":   { "kind": "tool", "min_version": "1.0.0",
                        "version_argv": ["{bin}", "--version"] },
-  "service:mariadb": { "kind": "service", "allocation": "shared-exclusive" }
+  "service:mariadb": { "kind": "service" }
 }
 ```
 
@@ -180,9 +180,26 @@ is a list of ids; an id that names no declared capability is a load-time error.
   probe (`{bin}` resolved host-locally), extracts the first semver-like token
   from stdout+stderr, and compares numerically; omit them for a presence-only
   check. **Preflight-only — never emitted into the run document.**
-- `allocation` (services): the behavior class (e.g. shared-exclusive) repos
-  read to self-serialize DB access. Descriptive in v1; the orchestrator does
-  not yet enforce a lock.
+- A `service:*` means **the platform provisions an endpoint the repo
+  consumes** — declare it only when a gate connects to a platform-provided
+  instance (typically to coordinate with other products or shared schemas on it).
+  It does **not** mean "the tests use a database." If a gate starts and owns its
+  *own* DB (a private container/process whose lifecycle it manages), that is a
+  **repo-private fixture**, not a service capability — the repo declares nothing
+  for it (e.g. `drift-mariadb-client` owns its instance lifecycle and does not
+  advertise `service:mariadb`). The recommended way to own a private DB is a
+  **Docker image on a private port** (portable, custom port, no cross-repo
+  interference); that depends on a container runtime, so the repo declares
+  **`tool:docker`** — model the actual external prerequisite, not the database.
+  Rule of thumb: name what the *platform* must provide. (Gates that start such a
+  fixture must also tear it down — see "Gates restore entry state" in the
+  onboarding doc.)
+- For a consumed `service`, the contract models **no schemas, locks, or
+  concurrency**: each project owns its own sandbox schema(s) against the instance
+  (created/dropped via its schema tool, e.g. Mariachi) and may create as many as
+  it needs. Isolation between projects is by separate schema, so the orchestrator
+  does not serialize a shared service across projects; any self-serialization is
+  the project's own gate concern.
 
 **Host-local `cert-env.json`** supplies the machine facts, keyed by capability
 id. It is host/CI-specific and **never committed** (gitignored). Lookup order:
@@ -193,11 +210,13 @@ id. It is host/CI-specific and **never committed** (gitignored). Lookup order:
 {
   "tool:mariachi":   { "bin": "/host/path/.venv/bin/mariachi" },
   "service:mariadb": { "host": "127.0.0.1", "port": 34114,
-                       "credential_env": "MDB_ROOT_PWD",
-                       "instance": "mdb114-a", "lock_key": "mariadb-mdb114-a" }
+                       "credential_env": "MDB_ROOT_PWD", "instance": "mdb114-a" }
 }
 ```
 
+For a service, `host`, `port`, and `credential_env` are required (the preflight
+enforces them); `instance` is an **optional** human-facing label — when the host
+omits it, the run document omits the key rather than emitting `null`.
 `credential_env` names the env var holding the secret — **the secret value
 never appears in any file**. The orchestrator validates it is set and inherits
 it by name into the gate environment; it adds only `DRIFT_CERT_CAPABILITIES`.
@@ -219,10 +238,9 @@ steps, so consumers never special-case a missing file. Emitted fields per kind:
   "run_id": "<run-id>",
   "capabilities": {
     "tool:mariachi":   { "kind": "tool", "bin": "<resolved path>" },
-    "service:mariadb": { "kind": "service", "allocation": "shared-exclusive",
+    "service:mariadb": { "kind": "service",
                          "host": "127.0.0.1", "port": 34114,
-                         "credential_env": "MDB_ROOT_PWD",
-                         "instance": "mdb114-a", "lock_key": "mariadb-mdb114-a" }
+                         "credential_env": "MDB_ROOT_PWD", "instance": "mdb114-a" }
   }
 }
 ```
