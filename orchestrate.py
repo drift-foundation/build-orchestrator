@@ -1714,6 +1714,7 @@ def check_provenance_completeness(
 @dataclass
 class RunContext:
     run_id: str
+    run_started_utc: str   # ISO 8601 (UTC); stamps cert-claim provenance
     run_root: Path
     checkouts_root: Path
     toolchain_root: Path
@@ -1732,6 +1733,7 @@ def create_run_context(config: OrchestrationConfig, plan: ExecutionPlan) -> RunC
     run_root = Path(config.run_root) / run_id
     ctx = RunContext(
         run_id=run_id,
+        run_started_utc=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         run_root=run_root,
         checkouts_root=run_root / "checkouts",
         toolchain_root=run_root / "toolchain",
@@ -1904,6 +1906,12 @@ def build_step_env(
     # retired DRIFT_OPTIMIZED) before re-adding only what this lane wants.
     env.pop("DRIFT_DEBUG", None)
     env.pop("DRIFT_OPTIMIZED", None)
+    # Provenance stamping: bind any `drift deploy` cert-claim emitted in this
+    # run to THIS orchestrator run. Without these, drift_deploy falls back to a
+    # random UUID and the epoch sentinel 1970-01-01T00:00:00Z for run_started_utc.
+    # Set for every step (only `drift deploy` reads them) so all emissions agree.
+    env["DRIFT_DEPLOY_RUN_ID"] = ctx.run_id
+    env["DRIFT_DEPLOY_RUN_STARTED_UTC"] = ctx.run_started_utc
     if gate and lane == "debug":
         env["DRIFT_DEBUG"] = "1"
     # Honor DRIFT_TEST_JOBS if the operator set it; otherwise default to
