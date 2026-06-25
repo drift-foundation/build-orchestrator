@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-06-24T20:18:20.945501+00:00",
-  "source_run_id": "20260624-192958-drift-lang-0f33ebc",
+  "updated_at": "2026-06-25T12:24:51.790580+00:00",
+  "source_run_id": "20260625-113636-drift-lang-c8ad2ec",
   "verdict": "certified",
   "changed_repos": [
     "drift-lang"
@@ -9,7 +9,7 @@
   "repos": {
     "drift-lang": {
       "path": "../drift-lang",
-      "commit": "0f33ebc865f3fc214cf6d74a22135b3eb70dbc84"
+      "commit": "c8ad2ec9bc14f6dd9684dbe4467ddf6f4fc14900"
     },
     "drift-mariadb-client": {
       "path": "../drift-mariadb-client",
