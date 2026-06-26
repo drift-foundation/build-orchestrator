@@ -98,7 +98,8 @@ Notes:
 - there is no `affects` field — the orchestrator walks `depends_on` upstream for provider staging (transitive closure) and reverses it for downstream invalidation, so adding a consumer never requires editing an upstream provider's config (a stale `affects` key is rejected at load)
 - every `depends_on` entry must name a configured repo; an unknown provider is a load-time error
 - commands are argv arrays, not shell strings
-- placeholder substitution should be done by the Python driver
+- placeholder substitution should be done by the Python driver (`{toolchain_root}`, `{libs_root}`, `{apps_root}`, `{staged_drift}`, `{staged_driftc}`)
+- a `stage_packages` recipe for a repo that declares any `kind: app` artifact must pass `--app-dest {apps_root}` in addition to `--dest {libs_root}`; driftc ≥ 0.33.61 hard-requires an app destination for app artifacts (the deploy also signs the app's author/cert legs, so a signing key must reach the invocation — see below)
 - repo-specific env can be added later if needed
 - certification inputs should be exact commit SHAs, not branch names or moving refs
 - `drift-lang` is a toolchain input and never a validation target

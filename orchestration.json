@@ -57,7 +57,7 @@
         "test": ["just", "test"],
         "stress": ["just", "stress"],
         "perf": ["just", "perf"],
-        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}"]
+        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{libs_root}", "--app-dest", "{apps_root}"]
       }
     }
   },

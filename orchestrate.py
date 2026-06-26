@@ -27,18 +27,24 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _RUN_SNAPSHOT_FORMAT = "drift-run-snapshot"
 _RUN_SNAPSHOT_VERSION = 0
 
-# Sidecar format constants (mirrored from drift-lang, trust-v1).
-# A v1 staged package has two JSON sidecars next to its .zdmp:
+# Sidecar format constants (mirrored from drift-lang).
+# A staged package has two JSON sidecars next to its .zdmp:
 #   <base>.author-claim                   — signed by the package author
 #   <base>.cert-claim.<kid>.json          — signed by the certifier; one
 #                                            per cert suite (sorted-first
 #                                            wins, matching resolver)
+# The outer envelope (`format` + `version`) is stable at v1, but the
+# claim *body* schema moved to v2 with the trust-v2 claims (driftc
+# 0.33.58+): the body gained artifact_kind / namespaces / required_deps
+# (author) and artifact_kind / target / dep_graph (cert). The fields orch
+# reads (package_id, version, source_content_id, signatures[0].kid) are
+# unchanged, so only the body-schema pins move.
 _AUTHOR_CLAIM_FORMAT = "drift-author-claim"
 _AUTHOR_CLAIM_VERSION = 1
-_AUTHOR_CLAIM_BODY_SCHEMA_VERSION = 1
+_AUTHOR_CLAIM_BODY_SCHEMA_VERSION = 2
 _CERT_CLAIM_FORMAT = "drift-cert-claim"
 _CERT_CLAIM_VERSION = 1
-_CERT_CLAIM_BODY_SCHEMA_VERSION = 1
+_CERT_CLAIM_BODY_SCHEMA_VERSION = 2
 
 # Strict validators for run-snapshot field shapes. The toolchain's
 # loader is strict; orch enforces the same shapes at emit time so
@@ -1719,6 +1725,7 @@ class RunContext:
     checkouts_root: Path
     toolchain_root: Path
     libs_root: Path
+    apps_root: Path
     logs_root: Path
 
 
@@ -1738,10 +1745,14 @@ def create_run_context(config: OrchestrationConfig, plan: ExecutionPlan) -> RunC
         checkouts_root=run_root / "checkouts",
         toolchain_root=run_root / "toolchain",
         libs_root=run_root / "libs",
+        apps_root=run_root / "apps",
         logs_root=run_root / "logs",
     )
 
-    for d in [ctx.checkouts_root, ctx.toolchain_root, ctx.libs_root, ctx.logs_root]:
+    for d in [
+        ctx.checkouts_root, ctx.toolchain_root, ctx.libs_root,
+        ctx.apps_root, ctx.logs_root,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
     return ctx
@@ -1783,6 +1794,7 @@ def resolve_placeholders(
     subs = {
         "{toolchain_root}": str(ctx.toolchain_root.resolve()),
         "{libs_root}": str(ctx.libs_root.resolve()),
+        "{apps_root}": str(ctx.apps_root.resolve()),
         "{staged_drift}": str((ctx.toolchain_root / "bin" / "drift").resolve()),
         "{staged_driftc}": str((ctx.toolchain_root / "bin" / "driftc").resolve()),
     }
@@ -1985,11 +1997,13 @@ def build_step_env(
     return env
 
 
-def _library_artifacts(manifest_path: Path) -> list[str]:
-    """Return the names of library artifacts declared in a manifest.
+def _authorable_artifacts(manifest_path: Path) -> list[str]:
+    """Return the names of authorable artifacts declared in a manifest.
 
-    Author claims are minted per library artifact, so these are exactly
-    the artifacts `drift author verify` (and `drift deploy`) check.
+    Author claims are minted per ``package`` and ``app`` artifact, so these
+    are exactly the artifacts `drift author verify` (and `drift deploy`)
+    check. (The old ``library`` kind was replaced by ``package``/``app`` in
+    driftc 0.33.57 and is a hard parse error as of 0.33.61.)
     """
     try:
         manifest = json.loads(manifest_path.read_text())
@@ -1997,7 +2011,7 @@ def _library_artifacts(manifest_path: Path) -> list[str]:
         return []
     names: list[str] = []
     for art in manifest.get("artifacts", []):
-        if art.get("kind", "library") == "library" and art.get("name"):
+        if art.get("kind", "package") in ("package", "app") and art.get("name"):
             names.append(art["name"])
     return names
 
@@ -2070,11 +2084,11 @@ def run_author_claim_preflight(
         manifest_path = (
             checkout_dirs[repo_name] / "drift" / "manifest.json"
         ).resolve()
-        artifacts = _library_artifacts(manifest_path)
+        artifacts = _authorable_artifacts(manifest_path)
         print(f"    {repo_name}:")
         if not artifacts:
-            print(f"      (no library artifacts in {manifest_path})")
-            failures.append((repo_name, "no library artifacts in manifest"))
+            print(f"      (no authorable artifacts in {manifest_path})")
+            failures.append((repo_name, "no authorable artifacts in manifest"))
             continue
         repos_checked += 1
         # Sub-indent one artifact per line (a repo may declare 10s of them)
@@ -2697,6 +2711,7 @@ def _build_summary(
             "run_root": str(ctx.run_root),
             "toolchain_root": str(ctx.toolchain_root),
             "libs_root": str(ctx.libs_root),
+            "apps_root": str(ctx.apps_root),
             "logs_root": str(ctx.logs_root),
             "toolchain_identity": _resolve_toolchain_identity(ctx),
         },
