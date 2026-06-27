@@ -51,7 +51,7 @@ Suggested shape:
       "depends_on": ["drift-lang"],
       "commands": {
         "test": ["just", "test"],
-        "stage_packages": ["drift", "deploy", "--dest", "{libs_root}"]
+        "stage_packages": ["drift", "deploy", "--dest", "{pkgs_root}"]
       }
     },
     "drift-net-tls": {
@@ -60,7 +60,7 @@ Suggested shape:
       "depends_on": ["drift-lang"],
       "commands": {
         "test": ["just", "test"],
-        "stage_packages": ["drift", "deploy", "--dest", "{libs_root}"]
+        "stage_packages": ["drift", "deploy", "--dest", "{pkgs_root}"]
       }
     },
     "drift-web": {
@@ -69,7 +69,7 @@ Suggested shape:
       "depends_on": ["drift-lang", "drift-net-tls"],
       "commands": {
         "test": ["just", "test"],
-        "stage_packages": ["drift", "deploy", "--dest", "{libs_root}"]
+        "stage_packages": ["drift", "deploy", "--dest", "{pkgs_root}"]
       }
     }
   },
@@ -79,8 +79,8 @@ Suggested shape:
     "drift_rel": "bin/drift",
     "vars": {
       "DRIFTC": "{toolchain_root}/bin/driftc",
-      "DRIFT_PACKAGE_ROOT": "{libs_root}",
-      "DRIFT_PKG_ROOT": "{libs_root}"
+      "DRIFT_PACKAGE_ROOT": "{pkgs_root}",
+      "DRIFT_PKG_ROOT": "{pkgs_root}"
     }
   },
   "cert_suite_policy": {
@@ -98,8 +98,8 @@ Notes:
 - there is no `affects` field — the orchestrator walks `depends_on` upstream for provider staging (transitive closure) and reverses it for downstream invalidation, so adding a consumer never requires editing an upstream provider's config (a stale `affects` key is rejected at load)
 - every `depends_on` entry must name a configured repo; an unknown provider is a load-time error
 - commands are argv arrays, not shell strings
-- placeholder substitution should be done by the Python driver (`{toolchain_root}`, `{libs_root}`, `{apps_root}`, `{staged_drift}`, `{staged_driftc}`)
-- a `stage_packages` recipe for a repo that declares any `kind: app` artifact must pass `--app-dest {apps_root}` in addition to `--dest {libs_root}`; driftc ≥ 0.33.61 hard-requires an app destination for app artifacts (the deploy also signs the app's author/cert legs, so a signing key must reach the invocation — see below)
+- placeholder substitution should be done by the Python driver (`{toolchain_root}`, `{pkgs_root}`, `{apps_root}`, `{staged_drift}`, `{staged_driftc}`)
+- a `stage_packages` recipe for a repo that declares any `kind: app` artifact must pass `--app-dest {apps_root}` in addition to `--dest {pkgs_root}`; driftc ≥ 0.33.61 hard-requires an app destination for app artifacts (the deploy also signs the app's author/cert legs, so a signing key must reach the invocation — see below)
 - repo-specific env can be added later if needed
 - certification inputs should be exact commit SHAs, not branch names or moving refs
 - `drift-lang` is a toolchain input and never a validation target
@@ -313,7 +313,7 @@ Suggested shape:
   "staging": {
     "run_root": "build/runs/20260320-153000-drift-lang-abc1234",
     "toolchain_root": "build/runs/20260320-153000-drift-lang-abc1234/toolchain",
-    "libs_root": "build/runs/20260320-153000-drift-lang-abc1234/libs",
+    "pkgs_root": "build/runs/20260320-153000-drift-lang-abc1234/pkgs",
     "logs_root": "build/runs/20260320-153000-drift-lang-abc1234/logs"
   },
   "steps": [

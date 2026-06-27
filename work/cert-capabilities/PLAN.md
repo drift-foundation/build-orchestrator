@@ -251,7 +251,7 @@ two-lane model, cert-mode env split, gate stdout contract, Lock v2, trust-v1, fa
 - `build_step_env`: 1514–1521; `environment.vars`/subs 1553–1561; sole call site 1894.
 - `execute_run`: checkout loop ends 1818; `write_empty_run_snapshot` 1827; block-and-return 1855–1868,
   1878–1892. Insert preflight + document write **between 1818 and 1827**.
-- `RunContext`: 1351–1358 (run_id, run_root, checkouts_root, toolchain_root, libs_root, logs_root).
+- `RunContext`: 1351–1358 (run_id, run_root, checkouts_root, toolchain_root, pkgs_root, logs_root).
 - argparse: `--config` 2531–2535; subparsers 2539/2555/2566.
 - `.gitignore`: ignores `.claude __pycache__ build .codex* .claude-session`; **`state/` NOT ignored.**
 - No existing host-local config mechanism — blank slate.

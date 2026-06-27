@@ -1076,8 +1076,8 @@ def toolchain_supports_provenance(version_output: Optional[str]) -> bool:
     return _parse_version_tuple(m.group(1)) >= (0, 27, 94)
 
 
-def scan_staged_artifacts(libs_root: Path) -> list[dict]:
-    """Scan the staged libs root for deployed artifacts.
+def scan_staged_artifacts(pkgs_root: Path) -> list[dict]:
+    """Scan the staged packages root for deployed artifacts.
 
     Returns a list of artifact records carrying paths to the trust-v1
     sidecars that sit next to each ``.zdmp``:
@@ -1095,11 +1095,11 @@ def scan_staged_artifacts(libs_root: Path) -> list[dict]:
     Descriptive only — records what's on disk. Strict trust-v1
     validation lives in ``build_run_snapshot``.
     """
-    if not libs_root.exists():
+    if not pkgs_root.exists():
         return []
 
     results: list[dict] = []
-    for artifact_dir in sorted(libs_root.iterdir()):
+    for artifact_dir in sorted(pkgs_root.iterdir()):
         if not artifact_dir.is_dir():
             continue
         artifact_name = artifact_dir.name
@@ -1278,7 +1278,7 @@ def write_empty_run_snapshot(run_id: str, out_path: Path) -> dict:
     0.31.6+ toolchain requires DRIFT_RUN_SNAPSHOT to point at a valid
     snapshot file for both stage and certify modes, so the first
     stage_packages step needs a file to reference. Subsequent
-    stage_packages refreshes rebuild from the full libs tree."""
+    stage_packages refreshes rebuild from the full packages tree."""
     snapshot = {
         "format": _RUN_SNAPSHOT_FORMAT,
         "version": _RUN_SNAPSHOT_VERSION,
@@ -1507,9 +1507,9 @@ def _preflight_service(cap: Capability, res: dict) -> Optional[str]:
 
 
 def build_run_snapshot(
-    libs_root: Path, run_id: str, out_path: Path,
+    pkgs_root: Path, run_id: str, out_path: Path,
 ) -> dict:
-    """Walk the staged libs root, read each package's trust-v1
+    """Walk the staged packages root, read each package's trust-v1
     ``.author-claim`` + ``.cert-claim.<kid>.json`` sidecars, and emit a
     run snapshot at ``out_path``. Strict on every field; raises
     RunSnapshotError on any violation. Builds the full entry dict in
@@ -1541,12 +1541,12 @@ def build_run_snapshot(
     author-claim. We pick the deterministic ``sorted-first`` cert-claim,
     matching the resolver's tie-break rule.
     """
-    if not libs_root.exists():
-        raise RunSnapshotError(f"staged libs_root missing: {libs_root}")
+    if not pkgs_root.exists():
+        raise RunSnapshotError(f"staged pkgs_root missing: {pkgs_root}")
 
     entries: dict[tuple[str, str], dict] = {}
 
-    for artifact_dir in sorted(libs_root.iterdir()):
+    for artifact_dir in sorted(pkgs_root.iterdir()):
         if not artifact_dir.is_dir():
             continue
         for version_dir in sorted(artifact_dir.iterdir()):
@@ -1724,7 +1724,7 @@ class RunContext:
     run_root: Path
     checkouts_root: Path
     toolchain_root: Path
-    libs_root: Path
+    pkgs_root: Path
     apps_root: Path
     logs_root: Path
 
@@ -1744,13 +1744,13 @@ def create_run_context(config: OrchestrationConfig, plan: ExecutionPlan) -> RunC
         run_root=run_root,
         checkouts_root=run_root / "checkouts",
         toolchain_root=run_root / "toolchain",
-        libs_root=run_root / "libs",
+        pkgs_root=run_root / "pkgs",
         apps_root=run_root / "apps",
         logs_root=run_root / "logs",
     )
 
     for d in [
-        ctx.checkouts_root, ctx.toolchain_root, ctx.libs_root,
+        ctx.checkouts_root, ctx.toolchain_root, ctx.pkgs_root,
         ctx.apps_root, ctx.logs_root,
     ]:
         d.mkdir(parents=True, exist_ok=True)
@@ -1793,7 +1793,7 @@ def resolve_placeholders(
     """Substitute staging path placeholders in a command argv."""
     subs = {
         "{toolchain_root}": str(ctx.toolchain_root.resolve()),
-        "{libs_root}": str(ctx.libs_root.resolve()),
+        "{pkgs_root}": str(ctx.pkgs_root.resolve()),
         "{apps_root}": str(ctx.apps_root.resolve()),
         "{staged_drift}": str((ctx.toolchain_root / "bin" / "drift").resolve()),
         "{staged_driftc}": str((ctx.toolchain_root / "bin" / "driftc").resolve()),
@@ -1931,11 +1931,11 @@ def build_step_env(
     if "DRIFT_TEST_JOBS" not in env:
         env["DRIFT_TEST_JOBS"] = str(max(1, (os.cpu_count() or 2) // 2))
     toolchain_root = str(ctx.toolchain_root.resolve())
-    libs_root = str(ctx.libs_root.resolve())
+    pkgs_root = str(ctx.pkgs_root.resolve())
 
     subs = {
         "{toolchain_root}": toolchain_root,
-        "{libs_root}": libs_root,
+        "{pkgs_root}": pkgs_root,
     }
     for var, template in config.environment.get("vars", {}).items():
         value = template
@@ -2239,7 +2239,7 @@ def execute_run(
     # file; the first stage_packages has no prior staged inputs, so an
     # empty-but-format-valid snapshot is the correct starting state.
     # Each successful stage_packages refreshes the file from the full
-    # libs tree so later stage steps can verify their upstream inputs.
+    # packages tree so later stage steps can verify their upstream inputs.
     snapshot_path = ctx.run_root / "run-snapshot.json"
     write_empty_run_snapshot(ctx.run_id, snapshot_path)
 
@@ -2385,7 +2385,7 @@ def execute_run(
                     if tc_ver:
                         print(f"    staged toolchain: {tc_ver}")
                 elif action == "stage_packages":
-                    current = scan_staged_artifacts(ctx.libs_root)
+                    current = scan_staged_artifacts(ctx.pkgs_root)
                     new_rows = [
                         (a["name"], a["version"]) for a in current
                         if (a["name"], a["version"]) not in seen_artifacts
@@ -2398,7 +2398,7 @@ def execute_run(
                     seen_artifacts.update(
                         (a["name"], a["version"]) for a in current
                     )
-                    # Refresh the run snapshot from the full libs tree
+                    # Refresh the run snapshot from the full packages tree
                     # after every successful stage_packages. The run
                     # interleaves stage/gate per repo (stage net-tls,
                     # gate net-tls, stage mariadb, gate mariadb, ...),
@@ -2413,7 +2413,7 @@ def execute_run(
                     # blocks the whole run.
                     try:
                         snapshot = build_run_snapshot(
-                            ctx.libs_root, ctx.run_id, snapshot_path,
+                            ctx.pkgs_root, ctx.run_id, snapshot_path,
                         )
                     except RunSnapshotError as e:
                         print(f"    snapshot refresh FAILED: {e}",
@@ -2512,10 +2512,10 @@ def execute_run(
 
     print()
 
-    # Collect artifact provenance from staged libs.
+    # Collect artifact provenance from staged packages.
     toolchain_version = get_toolchain_version(ctx)
     require_provenance = toolchain_supports_provenance(toolchain_version)
-    artifacts = scan_staged_artifacts(ctx.libs_root)
+    artifacts = scan_staged_artifacts(ctx.pkgs_root)
 
     if artifacts and verdict == "certified":
         prov_errors = check_provenance_completeness(artifacts, require_provenance)
@@ -2573,7 +2573,7 @@ def _artifact_path_lines(
     """Render the sidecar-paths block for one artifact record.
 
     *rewrite*, if given, is applied to each path string (used by
-    ``promote_run`` to re-root paths under ``libs/``). The same renderer
+    ``promote_run`` to re-root paths under ``pkgs/``). The same renderer
     is used by the in-run ``artifacts.txt`` and the promoted snapshot's
     ``artifacts.txt`` so both stay in sync as new sidecars appear.
     """
@@ -2710,7 +2710,7 @@ def _build_summary(
         "staging": {
             "run_root": str(ctx.run_root),
             "toolchain_root": str(ctx.toolchain_root),
-            "libs_root": str(ctx.libs_root),
+            "pkgs_root": str(ctx.pkgs_root),
             "apps_root": str(ctx.apps_root),
             "logs_root": str(ctx.logs_root),
             "toolchain_identity": _resolve_toolchain_identity(ctx),
@@ -2805,7 +2805,8 @@ def promote_run(run_id: str, dest_root: Path) -> int:
 
     Layout:
         <dest_root>/certified/snapshots/<run-id>/toolchain/
-        <dest_root>/certified/snapshots/<run-id>/libs/
+        <dest_root>/certified/snapshots/<run-id>/pkgs/
+        <dest_root>/certified/snapshots/<run-id>/apps/   (if any kind:app artifacts)
         <dest_root>/certified/snapshots/<run-id>/summary.json
         <dest_root>/certified/snapshots/<run-id>/report.txt
         <dest_root>/certified/current -> snapshots/<run-id>
@@ -2830,13 +2831,15 @@ def promote_run(run_id: str, dest_root: Path) -> int:
 
     staging = summary.get("staging", {})
     toolchain_root_str = staging.get("toolchain_root", "")
-    libs_root_str = staging.get("libs_root", "")
-    if not toolchain_root_str or not libs_root_str:
+    # `pkgs_root` is the current key; fall back to the legacy `libs_root`
+    # so summaries written before the libs→pkgs rename still promote.
+    pkgs_root_str = staging.get("pkgs_root") or staging.get("libs_root", "")
+    if not toolchain_root_str or not pkgs_root_str:
         print(f"error: run {run_id} summary is missing staging roots",
               file=sys.stderr)
         return 1
     source_toolchain_root = Path(toolchain_root_str)
-    source_libs_root = Path(libs_root_str)
+    source_pkgs_root = Path(pkgs_root_str)
 
     resolved_dest = dest_root.expanduser().resolve()
 
@@ -2863,11 +2866,11 @@ def promote_run(run_id: str, dest_root: Path) -> int:
 
     snapshot_dir.mkdir(parents=True)
     snapshot_toolchain = snapshot_dir / "toolchain"
-    snapshot_libs = snapshot_dir / "libs"
+    snapshot_pkgs = snapshot_dir / "pkgs"
 
     print(f"Promoting certified run: {run_id}")
     print(f"  source toolchain: {source_toolchain_root}")
-    print(f"  source libs:      {source_libs_root}")
+    print(f"  source pkgs:      {source_pkgs_root}")
     print(f"  snapshot:         {snapshot_dir}")
     print()
 
@@ -2881,14 +2884,31 @@ def promote_run(run_id: str, dest_root: Path) -> int:
 
     shutil.copytree(source_toolchain_root, snapshot_toolchain, symlinks=True)
 
-    # Copy libs.
-    if not source_libs_root.exists():
-        print(f"error: staged libs root not found: {source_libs_root}",
+    # Copy packages.
+    if not source_pkgs_root.exists():
+        print(f"error: staged packages root not found: {source_pkgs_root}",
               file=sys.stderr)
         shutil.rmtree(snapshot_dir)
         return 1
 
-    shutil.copytree(source_libs_root, snapshot_libs, symlinks=True)
+    shutil.copytree(source_pkgs_root, snapshot_pkgs, symlinks=True)
+
+    # Copy apps (kind:app artifacts staged via --app-dest). Optional: the
+    # key is absent in pre-app-cert summaries and the dir is empty when no
+    # app was staged this run. A certified app dir carries the binary plus
+    # its author/cert/provenance legs, so it must travel with the snapshot
+    # or `verify-app` and app consumers can't resolve it from certified/.
+    apps_root_str = staging.get("apps_root", "")
+    source_apps_root = Path(apps_root_str) if apps_root_str else None
+    if (
+        source_apps_root
+        and source_apps_root.exists()
+        and any(source_apps_root.iterdir())
+    ):
+        shutil.copytree(
+            source_apps_root, snapshot_dir / "apps", symlinks=True,
+        )
+        print(f"  source apps:      {source_apps_root}")
 
     # Copy certification metadata into the snapshot.
     for name in ("summary.json", "report.txt", "report-short.txt"):
@@ -2904,14 +2924,17 @@ def promote_run(run_id: str, dest_root: Path) -> int:
             shutil.copy2(lock_src, snapshot_dir / "workspace-lock.json")
 
     # Generate snapshot-local artifacts.txt by re-rooting actual artifact
-    # paths from the summary relative to the snapshot's libs/ directory.
+    # paths from the summary relative to the snapshot's pkgs/ directory.
+    # Reuses pkgs_root_str / apps_root_str resolved above (legacy-key aware).
     artifacts = summary.get("artifacts", [])
-    libs_root_str = staging.get("libs_root", "")
 
     def _rereoot(src_path: str) -> str:
-        if libs_root_str and src_path.startswith(libs_root_str):
-            rel = src_path[len(libs_root_str):].lstrip("/")
-            return f"libs/{rel}"
+        if pkgs_root_str and src_path.startswith(pkgs_root_str):
+            rel = src_path[len(pkgs_root_str):].lstrip("/")
+            return f"pkgs/{rel}"
+        if apps_root_str and src_path.startswith(apps_root_str):
+            rel = src_path[len(apps_root_str):].lstrip("/")
+            return f"apps/{rel}"
         return src_path
 
     art_lines: list[str] = []
@@ -2933,7 +2956,7 @@ def promote_run(run_id: str, dest_root: Path) -> int:
     print("Promotion complete:")
     print(f"  snapshot:  {snapshot_dir}")
     print(f"  toolchain: {snapshot_toolchain}")
-    print(f"  libs:      {snapshot_libs}")
+    print(f"  pkgs:      {snapshot_pkgs}")
     print(f"  current:   {current_symlink} -> {current_symlink.resolve()}")
     return 0
 

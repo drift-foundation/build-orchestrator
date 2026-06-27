@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-06-26T18:10:04.153327+00:00",
-  "source_run_id": "20260626-172053-drift-lang-e5eaa46",
+  "updated_at": "2026-06-26T19:31:00.489531+00:00",
+  "source_run_id": "20260626-184159-drift-lang-e5eaa46",
   "verdict": "certified",
   "changed_repos": [
     "drift-lang",

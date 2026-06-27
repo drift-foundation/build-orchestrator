@@ -80,7 +80,7 @@ snapshot-scoped directory:
   snapshots/
     <run-id>/
       toolchain/          # staged toolchain (with current symlink)
-      libs/               # staged package artifacts
+       pkgs/ # staged package artifacts
       summary.json        # certification evidence
       report.txt
       report-short.txt

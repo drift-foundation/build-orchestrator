@@ -110,7 +110,7 @@ Operational rule:
 Every orchestration run should use isolated staging locations, for example:
 
 - toolchain staging root: `build/runs/<run-id>/toolchain`
-- package staging root: `build/runs/<run-id>/libs`
+- package staging root: `build/runs/<run-id>/pkgs`
 - logs/state root: `build/runs/<run-id>/state`
 
 The orchestrator should validate everything against these staging roots first. Promotion to a persistent target is a separate step.
@@ -215,7 +215,7 @@ repos:
       - drift-lang
     commands:
       test: just test
-      deploy: drift deploy --dest {libs_root}
+      deploy: drift deploy --dest {pkgs_root}
 
   drift-net-tls:
     path: ../drift-net-tls
@@ -224,7 +224,7 @@ repos:
       - drift-lang
     commands:
       test: just test
-      deploy: drift deploy --dest {libs_root}
+      deploy: drift deploy --dest {pkgs_root}
 
   drift-web:
     path: ../drift-web
@@ -234,7 +234,7 @@ repos:
       - drift-net-tls
     commands:
       test: just test
-      deploy: drift deploy --dest {libs_root}
+      deploy: drift deploy --dest {pkgs_root}
 ```
 
 This is only a shape, not final syntax.
@@ -259,14 +259,14 @@ Each orchestrator run should:
 2. stage a fresh toolchain deployment using the candidate's own staged Drift tooling
 3. export `DRIFTC` from the staged toolchain
 4. run downstream repos against that staged toolchain
-5. publish downstream packages into the staged libs root as needed
-6. run downstream consumer repos against the staged libs root
+5. publish downstream packages into the staged packages root as needed
+6. run downstream consumer repos against the staged packages root
 7. emit a certification verdict
 
 ### Example: `drift-net-tls` Changed
 
 1. materialize the selected `drift-net-tls` candidate commit in a fresh checkout
-2. build/deploy staged `net-tls` package into the run-local libs root
+2. build/deploy staged `net-tls` package into the run-local packages root
 3. run `drift-web` test against that staged package root
 4. emit a certification verdict
 
@@ -277,8 +277,8 @@ The orchestrator should construct a per-run environment contract that every repo
 Proposed variables:
 
 - `DRIFTC=<run-toolchain>/bin/driftc`
-- `DRIFT_PACKAGE_ROOT=<run-libs-root>`
-- `DRIFT_PKG_ROOT=<run-libs-root>` where expected by existing tooling
+- `DRIFT_PACKAGE_ROOT=<run-pkgs-root>`
+- `DRIFT_PKG_ROOT=<run-pkgs-root>` where expected by existing tooling
 - `PATH=<run-toolchain>/bin:...` only if needed, but explicit vars remain preferred
 
 Important rule:
@@ -490,7 +490,7 @@ Success criteria:
 
 Deliverables:
 
-- package repos can deploy to run-local staged libs root
+- package repos can deploy to run-local staged packages root
 - downstream repos resolve against staged package outputs
 - no lockfile regeneration is required during validation
 

@@ -21,7 +21,7 @@ toolchain on `PATH` and `DRIFT_TOOLCHAIN_ROOT` set.
 
 | Command | Role | When it runs |
 |---|---|---|
-| `stage_packages` | Produce/sign your packages into the shared libs root | producer phase |
+| `stage_packages` | Produce/sign your packages into the shared packages root | producer phase |
 | `test` | Functional correctness gate | certification gate |
 | `stress` | Concurrency/contention gate | certification gate |
 | `perf` | Throughput-vs-baseline gate | certification gate |
@@ -72,8 +72,8 @@ artifact. The orchestrator certifies what is in the commit it checked out.
 - Ship a `drift/manifest.json` at the checkout root (a single repo may declare
   multiple artifacts in one manifest — the multi-artifact convention).
 - **Lock v2 is required**; v1 locks are rejected.
-- Staging runs against the shared libs root via the staged `drift`; the bare
-  `drift deploy --dest <libs_root>` form is what the orchestrator expects.
+- Staging runs against the shared packages root via the staged `drift`; the bare
+  `drift deploy --dest <pkgs_root>` form is what the orchestrator expects.
 
 ---
 
