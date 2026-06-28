@@ -1,7 +1,7 @@
 {
-  "drift-lang": "2632f28ddfcae12e0e36085f24e60ce6ccdfc931",
+  "drift-lang": "2401132479ea5325f97135c3ffaef19e528e8009",
   "drift-mariadb-client": "a0af42a5f7c3c3096ea8d0dc072a21b1c3ca554f",
   "drift-net-tls": "8282d893a05b4e54e19c9e98a0a2b89376f36d5f",
-  "drift-web": "40259d2411293151dfe9e635f79731b1fbefec90",
+  "drift-web": "5f365c3d60d03bb0a9f2408751da51f83988cb1e",
   "drift-workflows": "76032d4a0f4d3567ffe87340b3aeb62c218046aa"
 }
