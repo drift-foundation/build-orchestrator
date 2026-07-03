@@ -23,7 +23,7 @@
         "test": ["just", "test"],
         "stress": ["just", "stress"],
         "perf": ["just", "perf"],
-        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{pkgs_root}"]
+        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{pkgs_root}", "--app-dest", "{apps_root}"]
       }
     },
     "drift-net-tls": {
@@ -34,7 +34,7 @@
         "test": ["just", "test"],
         "stress": ["just", "stress"],
         "perf": ["just", "perf"],
-        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{pkgs_root}"]
+        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{pkgs_root}", "--app-dest", "{apps_root}"]
       }
     },
     "drift-web": {
@@ -45,7 +45,7 @@
         "test": ["just", "test"],
         "stress": ["just", "stress"],
         "perf": ["just", "perf"],
-        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{pkgs_root}"]
+        "stage_packages": ["{staged_drift}", "deploy", "--dest", "{pkgs_root}", "--app-dest", "{apps_root}"]
       }
     },
     "drift-workflows": {
