@@ -1914,6 +1914,13 @@ def build_step_env(
     owns the runtime-lane selector.
     """
     env = dict(os.environ)
+    # Force unbuffered stdout/stderr on any embedded-CPython drift-CLI
+    # invocation (drift/driftc are scie/embedded-CPython binaries that
+    # block-buffer under a pipe otherwise, so the activity watchdog below
+    # sees nothing until the process exits and flushes — confirmed via
+    # drift-workflows' 20260710T210823Z repro of the stage_packages
+    # watchdog kill). Harmless for non-Python subprocesses.
+    env["PYTHONUNBUFFERED"] = "1"
     # Hermetic lane selection: scrub any inherited DRIFT_DEBUG (and the
     # retired DRIFT_OPTIMIZED) before re-adding only what this lane wants.
     env.pop("DRIFT_DEBUG", None)
@@ -2337,14 +2344,26 @@ def execute_run(
                     resolved_cmd, cwd=cwd, env=step_env,
                     stdout=lf, stderr=subprocess.STDOUT,
                 )
-                # Activity-based timeout: kill after 120s of no new
+                # Activity-based timeout: kill after N seconds of no new
                 # output. Gate recipes are contractually required to
                 # emit progress on stdout/stderr (at least every ~60s)
                 # so this watchdog catches true hangs quickly. If a
                 # recipe redirects test output to side logs without a
                 # stream copy, it violates the contract and will trip
                 # this watchdog — fix the recipe, not the limit.
-                _inactivity_limit = 120
+                #
+                # stage_packages is a deliberate exception: its command is
+                # `drift deploy` (not a repo recipe we control), and its
+                # dominant phase — the --source-rebuild fresh-graph compile
+                # for the final app artifact — is legitimately silent for
+                # ~108s on an idle host even with PYTHONUNBUFFERED=1 (no
+                # per-module progress is emitted during that compile).
+                # 120s left ~11% headroom, so any modest host load flaked
+                # the watchdog (confirmed via drift-workflows' 20260710
+                # repro of run 20260710-193117's rejection). Widened here
+                # rather than raised globally so true hangs in gate steps
+                # are still caught quickly.
+                _inactivity_limit = 300 if action == "stage_packages" else 120
                 lf.flush()
                 _last_size = os.path.getsize(log_file)
                 _last_activity = time.monotonic()
