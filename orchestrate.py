@@ -138,6 +138,7 @@ class OrchestrationConfig:
     workspace_root: str
     run_root: str
     state_root: str
+    history_root: str
     repos: dict[str, RepoConfig]
     environment: dict
     cert_suite_policy: dict = field(default_factory=dict)
@@ -180,6 +181,7 @@ class OrchestrationConfig:
             workspace_root=raw["workspace"]["root"],
             run_root=raw["workspace"]["run_root"],
             state_root=raw["workspace"]["state_root"],
+            history_root=raw["workspace"].get("history_root", "history"),
             repos=repos,
             environment=raw.get("environment", {}),
             cert_suite_policy=cert_suite_policy,
@@ -2318,6 +2320,12 @@ def execute_run(
         step_env = build_step_env(
             config, ctx, gate=is_gate, lane=lane, action=action,
         )
+        # Snapshot the power/hardware state at gate time — the numbers a
+        # perf gate measures are only comparable under a known profile,
+        # and the ambient state can change between gate and run end.
+        perf_env: Optional[dict] = None
+        if is_gate and action == "perf":
+            perf_env = _capture_perf_environment()
         step_started = datetime.now(timezone.utc)
         contract_violation = False
         returncode: Optional[int] = None
@@ -2523,6 +2531,12 @@ def execute_run(
             step_record["DRIFT_DEBUG"] = step_env.get("DRIFT_DEBUG", "")
             if contract_violation:
                 step_record["contract_violation"] = True
+        if perf_env is not None:
+            step_record["perf_environment"] = perf_env
+            warn = _power_profile_warning(perf_env)
+            if warn:
+                step_record["power_profile_warning"] = warn
+                print(f"    perf-env warning: {warn}")
         step_results.append(step_record)
 
         # Fail fast: stop on first failure.
@@ -2569,6 +2583,7 @@ def execute_run(
     # Update the config-scoped workspace lock only on certified verdict.
     if verdict == "certified":
         _update_workspace_lock(config, plan, ctx, summary)
+        _record_perf_history(config, plan, ctx, summary)
 
     total_elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
     print(f"Verdict: {verdict}  ({_fmt_duration(total_elapsed)} total)")
@@ -2782,6 +2797,229 @@ def _update_workspace_lock(
 
     lock_path.write_text(json.dumps(lock_data, indent=2) + "\n")
     print(f"Updated: {lock_path}")
+
+
+# ---------------------------------------------------------------------------
+# Perf history
+# ---------------------------------------------------------------------------
+
+# Gate recipes tag their measurement output with these markers (see the
+# gate stdout contract). Everything else in a perf log is build/staging
+# noise and is not preserved.
+_PERF_LINE_MARKERS = ("[perf]", "[perf-gate]", "[perf-smoke]")
+
+# name=1.23 / name<=1.23 pairs with a numeric value. The optional '<'
+# also captures threshold lines ("fw<=1.92"). The lookahead rejects
+# partial matches inside hashes/versions ("abc=1.2.3").
+_PERF_PAIR_RE = re.compile(r"([A-Za-z_][\w.-]*?)<?=(-?\d+(?:\.\d+)?)(?![\w.])")
+
+_PERF_MACHINE_RE = re.compile(r"\bmachine=([0-9a-f]{8,})")
+
+
+def _extract_perf_lines(log_path: Path) -> list[str]:
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return []
+    return [
+        line.strip() for line in text.splitlines()
+        if line.strip().startswith(_PERF_LINE_MARKERS)
+    ]
+
+
+def _parse_perf_metrics(perf_lines: list[str]) -> dict[str, float]:
+    """Best-effort key=value extraction from tagged measurement lines.
+
+    Each line contributes its numeric pairs, prefixed by the line's label
+    (the text between the marker and the first pair) when one exists:
+    ``[perf-smoke] go-raw-tcp req_per_sec=294117`` becomes
+    ``go-raw-tcp.req_per_sec``. Lines that don't parse are still kept
+    verbatim in the history record's ``raw_lines``.
+    """
+    metrics: dict[str, float] = {}
+    for line in perf_lines:
+        body = line.split("]", 1)[1].strip() if "]" in line else line
+        first = _PERF_PAIR_RE.search(body)
+        if not first:
+            continue
+        label = body[:first.start()]
+        label = re.sub(r"\([^)]*\)", "", label)      # drop "(higher=worse)"
+        label = label.strip().strip(":,").strip()
+        label = re.sub(r"\s+", "_", label)
+        for name, value in _PERF_PAIR_RE.findall(body):
+            key = f"{label}.{name}" if label else name
+            metrics[key] = float(value) if "." in value else int(value)
+    return metrics
+
+
+def _read_first_line(path: str) -> Optional[str]:
+    try:
+        with open(path) as f:
+            return f.readline().strip() or None
+    except OSError:
+        return None
+
+
+def _capture_perf_environment() -> dict:
+    """Best-effort fingerprint of external factors that move perf numbers.
+
+    The machine key (/etc/machine-id) only identifies the OS install; it
+    survives CPU/RAM swaps, kernel upgrades, governor changes, and Go
+    toolchain bumps (the Go baselines are compiled by the ambient `go`).
+    Recording these per certified run lets a trend break be checked
+    against environment changes before blaming the code under test.
+    Every field is None when unavailable rather than failing the record.
+    """
+    env: dict = {}
+
+    cpu_model = microcode = None
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if cpu_model is None and line.startswith("model name"):
+                    cpu_model = line.split(":", 1)[1].strip()
+                elif microcode is None and line.startswith("microcode"):
+                    microcode = line.split(":", 1)[1].strip()
+                if cpu_model and microcode:
+                    break
+    except OSError:
+        pass
+    env["cpu_model"] = cpu_model
+    env["cpu_microcode"] = microcode
+    env["cpu_count"] = os.cpu_count()
+
+    mem_total_kb = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    mem_total_kb = int(line.split()[1])
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    env["mem_total_kb"] = mem_total_kb
+
+    env["kernel"] = " ".join(os.uname()[:3]) if hasattr(os, "uname") else None
+    env["cpu_governor"] = _read_first_line(
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    env["cpu_scaling_driver"] = _read_first_line(
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver")
+    env["cpu_energy_perf_pref"] = _read_first_line(
+        "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")
+    env["cpu_scaling_max_khz"] = _read_first_line(
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")
+    env["cpu_boost"] = _read_first_line("/sys/devices/system/cpu/cpufreq/boost")
+    env["smt"] = _read_first_line("/sys/devices/system/cpu/smt/control")
+    env["transparent_hugepages"] = _read_first_line(
+        "/sys/kernel/mm/transparent_hugepage/enabled")
+
+    mitigations: dict[str, str] = {}
+    try:
+        vuln_dir = Path("/sys/devices/system/cpu/vulnerabilities")
+        for entry in sorted(vuln_dir.iterdir()):
+            value = _read_first_line(str(entry))
+            if value and value != "Not affected":
+                mitigations[entry.name] = value
+    except OSError:
+        pass
+    env["cpu_mitigations"] = mitigations or None
+
+    go_version = None
+    try:
+        out = subprocess.run(
+            ["go", "version"], capture_output=True, text=True, timeout=10)
+        if out.returncode == 0:
+            go_version = out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    env["go_version"] = go_version
+
+    return env
+
+
+def _power_profile_warning(env: dict) -> Optional[str]:
+    """Non-fatal complaint when perf gates run on an unpinned power profile.
+
+    A new host defaults to a balanced profile; numbers measured there are
+    not comparable with performance-pinned ones and quietly widen run
+    variance. Governor 'performance' OR EPP 'performance' counts as
+    pinned (amd-pstate's powersave governor with EPP=performance biases
+    fully to perf while still idling down).
+    """
+    gov = env.get("cpu_governor")
+    epp = env.get("cpu_energy_perf_pref")
+    if gov is None and epp is None:
+        return ("cpufreq state unreadable; cannot confirm the CPU is "
+                "pinned to performance for perf measurement")
+    parts = []
+    if gov != "performance" and epp != "performance":
+        parts.append(
+            f"cpu not pinned to performance (governor={gov}, epp={epp}); "
+            f"perf numbers ride the ambient power profile")
+    if env.get("cpu_boost") == "0":
+        parts.append("cpu boost disabled")
+    return "; ".join(parts) or None
+
+
+def _record_perf_history(
+    config: OrchestrationConfig,
+    plan: ExecutionPlan,
+    ctx: RunContext,
+    summary: dict,
+) -> None:
+    """Append per-repo perf-gate measurements to history/perf/<repo>.jsonl.
+
+    Called only on a certified verdict: the point is the long-run trend of
+    numbers that were *accepted*, so slow drift is visible across certified
+    runs instead of compounding silently under a static threshold. Rejected
+    runs keep their evidence in build/runs/<id>/logs and are not recorded.
+    """
+    hist_dir = Path(config.history_root) / "perf"
+    ambient_env: Optional[dict] = None  # fallback, captured once if needed
+    for step in summary["steps"]:
+        if step.get("name") != "perf" or step.get("status") != "ok":
+            continue
+        if not step.get("certification_gate"):
+            continue
+        repo = step["repo"]
+        perf_lines = _extract_perf_lines(Path(step["log_path"]))
+        if not perf_lines:
+            continue
+        machine = next(
+            (m.group(1) for line in perf_lines
+             if (m := _PERF_MACHINE_RE.search(line))), None)
+        # Prefer the state snapshotted while the gate ran; fall back to
+        # capturing now for summaries that predate per-step snapshots.
+        environment = step.get("perf_environment")
+        if environment is None:
+            if ambient_env is None:
+                ambient_env = _capture_perf_environment()
+            environment = ambient_env
+        warning = (step.get("power_profile_warning")
+                   or _power_profile_warning(environment))
+        record = {
+            "schema_version": 1,
+            "run_id": ctx.run_id,
+            "recorded_at": summary["finished_at"],
+            "repo": repo,
+            "commit": plan.candidate_commits.get(repo),
+            "changed": repo in plan.changed_repos,
+            "lane": step.get("lane"),
+            "toolchain_version": summary.get("toolchain_version"),
+            "drift_lang_commit": plan.candidate_commits.get("drift-lang"),
+            "machine": machine,
+            "environment": environment,
+            "environment_warning": warning,
+            "duration_s": step.get("duration_s"),
+            "metrics": _parse_perf_metrics(perf_lines),
+            "raw_lines": perf_lines,
+        }
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        out_path = hist_dir / f"{repo}.jsonl"
+        with out_path.open("a") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+        print(f"Recorded perf history: {out_path} "
+              f"[{step.get('lane')}] ({len(record['metrics'])} metrics)")
 
 
 # ---------------------------------------------------------------------------

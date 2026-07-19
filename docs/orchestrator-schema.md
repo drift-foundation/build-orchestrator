@@ -34,7 +34,8 @@ Suggested shape:
   "workspace": {
     "root": "..",
     "run_root": "build/runs",
-    "state_root": "state"
+    "state_root": "state",
+    "history_root": "history"
   },
   "repos": {
     "drift-lang": {
@@ -400,6 +401,88 @@ Update rule:
 - write this file only after a `certified` run
 - do not modify it for `rejected` or `blocked` runs
 - do not modify it for runs that were not based on exact committed fresh checkouts
+
+## 4. `history/perf/<repo>.jsonl`
+
+Purpose:
+
+- preserve, in the checked-in tree, the perf-gate measurements of every
+  **certified** run, so slow drift is visible as a trend instead of
+  compounding silently under a static pass/fail threshold
+- rejected/blocked runs are *not* recorded — their evidence stays in the
+  ephemeral `build/runs/<id>/logs/`
+
+Written by the orchestrator right after the workspace lock update, one
+JSON line appended per (repo, lane) perf gate that ran and passed in the
+certified run. Repos reused from the certified snapshot (perf not re-run)
+contribute no entry for that run.
+
+Record shape:
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "20260718-141402-drift-lang-99a68ee",
+  "recorded_at": "2026-07-18T12:47:00+00:00",
+  "repo": "drift-web",
+  "commit": "e8cf4433…",
+  "changed": false,
+  "lane": "normal",
+  "toolchain_version": "driftc 0.33.84 | abi 21 | git 99a68ee1",
+  "drift_lang_commit": "99a68ee1…",
+  "machine": "8bb9310c…",
+  "environment": {
+    "cpu_model": "AMD Ryzen 9 9950X3D 16-Core Processor",
+    "cpu_microcode": "0xb404023",
+    "cpu_count": 32,
+    "mem_total_kb": 31951972,
+    "kernel": "Linux slryzen 6.17.0-41-generic",
+    "cpu_governor": "powersave",
+    "cpu_scaling_driver": "amd-pstate-epp",
+    "cpu_energy_perf_pref": "balance_performance",
+    "cpu_scaling_max_khz": "5756452",
+    "cpu_boost": "1",
+    "smt": "on",
+    "transparent_hugepages": "always [madvise] never",
+    "cpu_mitigations": { "spectre_v2": "Mitigation: …" },
+    "go_version": "go version go1.24.4 linux/amd64"
+  },
+  "duration_s": 19.0,
+  "metrics": { "measured_cost.fw": 1.89, "baseline-health.req_per_sec": 166666 },
+  "raw_lines": ["[perf-gate] …"]
+}
+```
+
+Parsing rules:
+
+- only lines tagged `[perf]` / `[perf-gate]` / `[perf-smoke]` are preserved
+  (`raw_lines`, verbatim — the lossless record)
+- `metrics` is best-effort `name=<number>` extraction from those lines,
+  prefixed with the line's label when present (`go-raw-tcp.req_per_sec`);
+  `name<=<number>` threshold forms are captured too (`thresholds.fw`)
+- gates whose measurement lines are prose rather than `key=value`
+  (currently drift-net-tls) get an empty `metrics` but full `raw_lines`;
+  fixing that is a recipe-side change under the gate stdout contract
+- `machine` is the perf gate's machine key when the gate prints
+  `machine=<hex>`, else null — filter on it before comparing across hosts.
+  Note the key is `/etc/machine-id`: it identifies the OS install and
+  survives hardware/kernel/toolchain changes — that is what `environment`
+  is for
+- `environment` is a best-effort hardware/OS fingerprint snapshotted **when
+  the perf gate starts** (CPU model + microcode, memory, kernel, cpufreq
+  governor/driver/EPP/boost, SMT, THP, active CPU mitigations, ambient
+  `go version` — the Go comparison baselines are built with it). It is
+  stashed on the step record (`perf_environment` in summary.json, all
+  verdicts), so even rejected runs preserve the measurement conditions.
+  When a trend breaks, diff this against the previous record before
+  blaming the code under test; unavailable fields are null, never fatal
+- `environment_warning` is non-null when the CPU was not pinned to a
+  performance profile during measurement (neither governor nor EPP is
+  `performance`), when boost was disabled, or when cpufreq state was
+  unreadable. The same warning is printed in the run output as the gate
+  finishes (`perf-env warning: …`), so a fresh machine measuring under a
+  balanced profile is caught on its first run, not discovered later in
+  the trend data. Warnings never fail the gate
 
 ## Suggested Python Data Model
 
